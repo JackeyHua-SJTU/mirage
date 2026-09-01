@@ -6,6 +6,7 @@ from __future__ import annotations
 import queue
 import threading
 import time
+from typing import Sequence
 
 import torch
 
@@ -194,30 +195,39 @@ class LLMEngine:
 
     def submit(
         self,
-        prompt: str,
+        prompt: str | None = None,
         use_template: bool = True,
         timeout: float = 120.0,
         poll_interval: float = 1e-4,
         stream: bool = False,
+        messages: Sequence[dict] | None = None,
     ):
-        """Submit a single prompt for generation.
+        """Submit one request — a chat conversation or a single prompt.
 
         Safe to call concurrently — each invocation gets a unique rid and
         queues it for admission under an internal lock.
 
         Args:
-            prompt:        String prompt.
-            use_template:  Apply chat template before tokenizing.
+            prompt:        String prompt; exclusive with *messages*.
+            use_template:  Apply chat template before tokenizing (*prompt* only).
             timeout:       Seconds to wait before raising :exc:`TimeoutError`.
             poll_interval: Seconds between completion-ring polls.
             stream:        If True, returns a generator yielding ``(text,
                            is_final)`` tuples. Otherwise returns a dict.
+            messages:      OpenAI messages list, rendered in full through the
+                           chat template so a multi-turn conversation keeps a
+                           growing token prefix.
 
         Returns:
             When stream=False: ``{"text": str, "token_ids": list[int]}``
             When stream=True:  generator yielding ``(text, is_final)``
         """
-        token_ids = self.tokenizer_manager.tokenize(prompt, use_template)
+        if (prompt is None) == (messages is None):
+            raise ValueError("submit takes exactly one of prompt= or messages=")
+        if messages is not None:
+            token_ids = self.tokenizer_manager.tokenize_messages(messages)
+        else:
+            token_ids = self.tokenizer_manager.tokenize(prompt, use_template)
         prompt_len = len(token_ids)
 
         t = torch.tensor(token_ids, dtype=torch.int64)

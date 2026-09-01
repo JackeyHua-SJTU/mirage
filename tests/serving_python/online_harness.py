@@ -16,6 +16,7 @@ Cases
     coldwarm     the same prompt twice in a row returns byte-identical text
     isolation10  10 concurrent requests keep their own marker and only their own
     seq12        12 sequential requests all succeed (request-ring wraparound)
+    multiturn    a 3-turn conversation: turn 3 still knows turn 1's code
     shutdown     the server exits within --shutdown-timeout of SIGTERM
 
 Usage::
@@ -66,6 +67,8 @@ MARKER_PREFIX = "MK7Q2-"
 MARKER_RE = re.compile(re.escape(MARKER_PREFIX) + r"\d{2}")
 ISOLATION_N = 10
 SEQ_N = 12
+# Outside the isolation10 range so a stray hit cannot be confused with one.
+MULTITURN_MARKER = f"{MARKER_PREFIX}31"
 
 EXIT_OK = 0
 EXIT_CASE_FAILED = 1
@@ -203,11 +206,11 @@ def content_of(body: object) -> str:
     return text
 
 
-def one_completion(ctx: "Context", prompt: str, what: str) -> str:
-    """Non-stream completion; raises :class:`CaseFailure` unless it succeeds."""
+def one_chat(ctx: "Context", messages: list[dict], what: str) -> str:
+    """Non-stream chat over a whole messages list; fails closed on anything else."""
     try:
         status, body = post_json(ctx.host, ctx.port, CHAT_PATH,
-                                 chat_payload(ctx.prompt(prompt)),
+                                 {"messages": messages, "stream": False},
                                  ctx.request_timeout)
     except (socket.timeout, TimeoutError):
         raise CaseFailure(
@@ -220,6 +223,12 @@ def one_completion(ctx: "Context", prompt: str, what: str) -> str:
     if not text.strip():
         raise CaseFailure(f"{what}: empty content")
     return text
+
+
+def one_completion(ctx: "Context", prompt: str, what: str) -> str:
+    """Non-stream completion; raises :class:`CaseFailure` unless it succeeds."""
+    return one_chat(ctx, [{"role": "user", "content": ctx.prompt(prompt)}],
+                    what)
 
 
 # ── server process ────────────────────────────────────────────────────────────
@@ -491,6 +500,40 @@ def case_seq12(ctx: Context) -> str:
     return f"{SEQ_N}/{SEQ_N} sequential requests succeeded"
 
 
+def case_multiturn(ctx: Context) -> str:
+    """Three turns, each sending the whole conversation so far.
+
+    This separates a server that renders the full messages list from one that
+    only ever reads the last user message: the code turn 3 asks for was given
+    in turn 1 and never repeated in a later user turn.  Only short, instructed
+    echoes are asserted, so it does not depend on long-generation determinism,
+    and it passes with the prefix cache on or off.
+    """
+    turns = [
+        f"Remember this code and repeat it back exactly: {MULTITURN_MARKER}",
+        "Thanks. Now say the word ok.",
+        "What was the code I gave you earlier? Reply with the code only.",
+    ]
+    messages: list[dict] = []
+    replies: list[str] = []
+    for index, text in enumerate(turns):
+        messages.append({"role": "user", "content": ctx.prompt(text)})
+        reply = one_chat(ctx, list(messages), f"multiturn/turn{index + 1}")
+        messages.append({"role": "assistant", "content": reply})
+        replies.append(reply)
+
+    if MULTITURN_MARKER not in replies[-1]:
+        raise CaseFailure(
+            f"turn 3 did not recall {MULTITURN_MARKER} from turn 1 "
+            f"(the server may be reading only the last user message): "
+            f"{replies[-1][:160]!r}")
+    foreign = sorted(set(MARKER_RE.findall(replies[-1])) - {MULTITURN_MARKER})
+    if foreign:
+        raise CaseFailure(f"turn 3 also produced foreign markers {foreign}")
+    return (f"3 turns, {len(messages)} messages on the last request, "
+            f"{MULTITURN_MARKER} recalled")
+
+
 def case_shutdown(ctx: Context) -> str:
     if ctx.server is None:
         raise SkipCase("attached to an external server")
@@ -514,7 +557,8 @@ CASES: list[tuple[str, str, object]] = [
     ("c", "coldwarm", case_coldwarm),
     ("d", "isolation10", case_isolation10),
     ("e", "seq12", case_seq12),
-    ("f", "shutdown", case_shutdown),
+    ("f", "multiturn", case_multiturn),
+    ("g", "shutdown", case_shutdown),
 ]
 
 

@@ -15,6 +15,7 @@ Modes
     chatter_after_done  emits a content chunk after ``[DONE]``
     wrong_marker      echoes another request's marker as well as its own
     nondeterministic  the same prompt yields different text each time
+    amnesia           reads only the last user message, forgetting the history
     empty_content     replies with empty content
     hang              accepts completion requests and never answers
     never_ready       ``/openapi.json`` keeps returning 500
@@ -35,7 +36,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 MARKER_RE = re.compile(r"MK7Q2-\d{2}")
 MODES = ("good", "dup_done", "no_done", "chatter_after_done", "wrong_marker",
-         "nondeterministic", "empty_content", "hang", "never_ready",
+         "nondeterministic", "amnesia", "empty_content", "hang", "never_ready",
          "no_shutdown")
 
 _counter = itertools.count()
@@ -64,11 +65,22 @@ def reply_text(prompt: str, mode: str) -> str:
     return text
 
 
-def extract_prompt(body: dict) -> str:
-    for message in reversed(body.get("messages") or []):
-        if message.get("role") == "user":
-            return message.get("content", "")
-    return body.get("prompt", "")
+def extract_prompt(body: dict, mode: str = "good") -> str:
+    """The text a correct server would have rendered into its prompt.
+
+    A real server renders the whole conversation, so a code given in turn 1 is
+    still visible in turn 3.  ``amnesia`` reproduces the pre-multiturn bug of
+    reading only the last user message.
+    """
+    messages = body.get("messages") or []
+    if not messages:
+        return body.get("prompt", "")
+    if mode == "amnesia":
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                return message.get("content", "")
+        return ""
+    return "\n".join(str(message.get("content", "")) for message in messages)
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -128,7 +140,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.mode == "hang":
             time.sleep(600)
             return
-        text = reply_text(extract_prompt(body), self.mode)
+        text = reply_text(extract_prompt(body, self.mode), self.mode)
         if body.get("stream"):
             self._stream(text)
         else:

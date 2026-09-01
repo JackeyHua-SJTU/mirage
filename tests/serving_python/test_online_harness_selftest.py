@@ -66,9 +66,9 @@ def assert_no_orphan(summary: dict) -> None:
 
 
 def test_good_mode_all_cases_pass():
-    proc, summary = run_harness("good", "a,b,c,d,e,f")
+    proc, summary = run_harness("good", "a,b,c,d,e,f,g")
     assert proc.returncode == EXIT_OK, proc.stderr[-3000:]
-    assert summary["counts"]["pass"] == 6, summary["cases"]
+    assert summary["counts"]["pass"] == 7, summary["cases"]
     assert summary["counts"]["fail"] == 0
     assert summary["exit_code"] == EXIT_OK
     assert_no_orphan(summary)
@@ -96,6 +96,7 @@ def test_ready_delay_is_polled_not_raced():
     ("chatter_after_done", "stream"),
     ("nondeterministic", "coldwarm"),
     ("wrong_marker", "isolation10"),
+    ("amnesia", "multiturn"),
     ("no_shutdown", "shutdown"),
 ])
 def test_planted_failure_is_caught(mode: str, case: str):
@@ -138,11 +139,11 @@ def test_strict_mode_is_the_default():
 
 def test_never_ready_fails_closed_without_hanging():
     started = time.monotonic()
-    proc, summary = run_harness("never_ready", "a,b,c,d,e,f",
+    proc, summary = run_harness("never_ready", "a,b,c,d,e,f,g",
                                 ready_timeout="5", run_timeout=90)
     assert proc.returncode == EXIT_SETUP_FAILED
     assert summary["setup_error"]
-    assert summary["counts"]["error"] == 6
+    assert summary["counts"]["error"] == 7
     assert summary["counts"]["pass"] == 0
     assert time.monotonic() - started < 45
     assert_no_orphan(summary)
@@ -161,7 +162,7 @@ def test_attach_mode_skips_shutdown_and_leaves_server_running():
             time.sleep(0.1)
         proc = subprocess.run(
             [sys.executable, HARNESS, "--attach-port", str(port),
-             "--host", HOST, "--cases", "a,f", "--request-timeout", "5"],
+             "--host", HOST, "--cases", "a,g", "--request-timeout", "5"],
             capture_output=True, text=True, timeout=120)
         summary = extract_summary(proc.stdout)
         assert proc.returncode == EXIT_OK, proc.stderr[-3000:]

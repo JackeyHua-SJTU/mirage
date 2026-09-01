@@ -23,6 +23,7 @@ from fastapi.responses import StreamingResponse
 
 from .model_runner import ModelRunner, RunnerConfig
 from .llm_engine import LLMEngine
+from .tokenizer_manager import ChatTemplateError, normalize_messages
 
 
 # ── Lifespan ──────────────────────────────────────────────────────────────────
@@ -54,16 +55,16 @@ async def _parse_json(request: Request) -> dict:
         raise HTTPException(status_code=400, detail="Invalid or empty JSON body")
 
 
-def _extract_prompt(messages: list[dict]) -> str:
-    """Pull the last user message from an OpenAI chat messages list."""
-    for msg in reversed(messages):
-        if msg.get("role") == "user":
-            return msg["content"]
-    return ""
+def _chat_messages(body: dict) -> list[dict]:
+    """Validate the request's messages list, answering 400 if it is malformed."""
+    try:
+        return normalize_messages(body.get("messages"))
+    except ChatTemplateError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
 
 async def _stream_bridge(
-    engine: LLMEngine, prompt: str, timeout: float,
+    engine: LLMEngine, timeout: float, **submit_kwargs,
 ) -> AsyncGenerator[str, None]:
     """Bridge a synchronous streaming generator to async SSE chunks.
 
@@ -81,7 +82,7 @@ async def _stream_bridge(
 
     def _run() -> None:
         try:
-            gen = engine.submit(prompt, stream=True, timeout=timeout)
+            gen = engine.submit(stream=True, timeout=timeout, **submit_kwargs)
             for text, is_final in gen:
                 loop.call_soon_threadsafe(_put, text, is_final, None)
         except BaseException as exc:
@@ -114,20 +115,21 @@ async def _stream_bridge(
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     body = await _parse_json(request)
-    prompt = _extract_prompt(body.get("messages", []))
+    messages = _chat_messages(body)
     stream = body.get("stream", False)
     timeout = request.app.state.request_timeout
 
     if stream:
         return StreamingResponse(
-            _stream_bridge(request.app.state.engine, prompt, timeout),
+            _stream_bridge(request.app.state.engine, timeout,
+                           messages=messages),
             media_type="text/event-stream",
         )
     else:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, lambda: request.app.state.engine.submit(
-                prompt, timeout=timeout),
+                messages=messages, timeout=timeout),
         )
         return {
             "id": "chatcmpl-0",
@@ -144,19 +146,25 @@ async def chat_completions(request: Request):
 async def completions(request: Request):
     body = await _parse_json(request)
     prompt = body.get("prompt", "")
+    # A raw continuation, not a chat turn: the template must not wrap it, and an
+    # empty prompt would publish a zero-length request to the kernel.
+    if not isinstance(prompt, str) or not prompt:
+        raise HTTPException(status_code=400,
+                            detail="'prompt' must be a non-empty string")
     stream = body.get("stream", False)
     timeout = request.app.state.request_timeout
 
     if stream:
         return StreamingResponse(
-            _stream_bridge(request.app.state.engine, prompt, timeout),
+            _stream_bridge(request.app.state.engine, timeout,
+                           prompt=prompt, use_template=False),
             media_type="text/event-stream",
         )
     else:
         loop = asyncio.get_running_loop()
         result = await loop.run_in_executor(
             None, lambda: request.app.state.engine.submit(
-                prompt, timeout=timeout),
+                prompt, use_template=False, timeout=timeout),
         )
         return {
             "id": "cmpl-0",
