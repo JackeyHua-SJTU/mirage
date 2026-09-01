@@ -417,6 +417,16 @@ class PersistentKernel:
         self.max_num_batched_tokens = max_num_batched_tokens
         self.max_num_pages = max_num_pages
         self.page_size = page_size
+        if mode == "online_pinned" and max_num_pages < self.max_pages_per_request:
+            # The admission gate reserves a request's worst-case page table
+            # up front, so a pool smaller than one worst case admits nothing
+            # at all — a silent wedge with no other symptom. Effective
+            # admission concurrency is max_num_pages // max_pages_per_request.
+            raise ValueError(
+                f"max_num_pages={max_num_pages} is below the worst-case page "
+                f"table of one request "
+                f"(ceil({max_seq_length}/{page_size})="
+                f"{self.max_pages_per_request}); no request could be admitted")
         self.eos_token_id = eos_token_id
         self.kn_graph = KNGraph(CyKNGraph(disable_fingerprint=True))
         # Prevent GC of PyTorch tensors whose GPU pointers are baked into the

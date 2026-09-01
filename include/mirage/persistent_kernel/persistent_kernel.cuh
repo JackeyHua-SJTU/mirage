@@ -474,6 +474,20 @@ __device__ __forceinline__ bool
 // for the token buffer so request IDs (rid) can increment without bound.
 //
 // Lock-free power-of-2 rings: index = cursor & (MPK_PINNED_RING_CAPACITY - 1).
+//
+// KV page ownership is inverted: the GPU allocates pages out of page_queue and
+// exports a completed request's page list on the completion ring, but only the
+// CPU releases pages, by writing them into pinned_page_return_ring. Step 0
+// drains that ring back into page_queue, and the Step 4 reservation ledger
+// (avail_uncommitted / reserved_remaining) makes the extra round trip safe: a
+// request is admitted only once its worst-case page budget is already free.
+
+// Per-iteration budget for the Step 0 drain. The scheduler lane is a single
+// thread reading pinned host memory across PCIe, so an unbounded drain would
+// put an arbitrarily long serial stall on the barrier point; the remainder is
+// picked up by the next iteration, which also runs while the batch is idle.
+constexpr int MPK_PAGE_RETURN_DRAIN_LIMIT = 32;
+
 __device__ __forceinline__ bool
     prepare_next_batch(RuntimeConfig const &config) {
   __shared__ int smem_kv_indices[MPK_MAX_NUM_PAGES];
@@ -483,7 +497,9 @@ __device__ __forceinline__ bool
   int gpu_comp_tail = *config.gpu_comp_tail;
   int free_row_top = *config.free_row_top;
   int avail_uncommitted = *config.avail_uncommitted;
+  int gpu_return_head = *config.gpu_return_head;
   int const ring_mask = MPK_PINNED_RING_CAPACITY - 1;
+  int const return_mask = MPK_PAGE_RETURN_RING_CAPACITY - 1;
 
   // Reclaim rows only after the CPU has copied their completed output and
   // release-stored -1 to pinned_step. The owner mapping stays stable for the
@@ -494,6 +510,24 @@ __device__ __forceinline__ bool
     if (owner >= 0 && progress == -1) {
       st_release_sys_i32(&config.pinned_rid_at_row[row], -1);
       config.free_rows[free_row_top++] = row;
+    }
+  }
+
+  // ── Step 0: drain the page-return ring ────────────────────────────────────
+  // The only place pages re-enter the free queue. The acquire load of the tail
+  // orders the CPU's id writes before this read, so every id below the tail is
+  // visible. A drained page is free and uncommitted again.
+  {
+    int32_t return_tail = ld_acquire_sys_i32(config.pinned_page_return_tail);
+    int drained = 0;
+    while (gpu_return_head != (int)return_tail &&
+           drained < MPK_PAGE_RETURN_DRAIN_LIMIT) {
+      config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] =
+          (int)config.pinned_page_return_ring[gpu_return_head & return_mask];
+      page_queue_tail++;
+      avail_uncommitted++;
+      gpu_return_head++;
+      drained++;
     }
   }
 
@@ -537,7 +571,7 @@ __device__ __forceinline__ bool
 
       // The page table still carries the previous iteration's layout here, so
       // paged_kv_indices_buffer[kv_indptr..] is the request's final KV page
-      // list — the same source the free loop below iterates.
+      // list — the handover the CPU releases on this request's behalf.
       int kv_indptr = config.paged_kv_indptr_buffer[i];
       int num_pages = config.paged_kv_indptr_buffer[i + 1] - kv_indptr;
 
@@ -567,19 +601,12 @@ __device__ __forceinline__ bool
       config.request_ids[i] = -1;
       config.request_rids[i] = -1;
 
-      // Refund the page budget this row reserved but never spent.
+      // The exported pages are now the CPU's; they come back through the
+      // page-return ring, not from here. Only the budget this row reserved but
+      // never spent is refunded, which leaves the free count untouched and so
+      // keeps avail_uncommitted == free - sum(reserved) exact.
       avail_uncommitted += config.reserved_remaining[row];
       config.reserved_remaining[row] = 0;
-
-      // Free pages back to the page queue. Export and free coexist while the
-      // CPU only validates the export; the CPU becomes the sole releaser when
-      // this loop is replaced by the page-return ring.
-      for (int j = 0; j < num_pages; j++) {
-        config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] =
-            config.paged_kv_indices_buffer[kv_indptr + j];
-        page_queue_tail++;
-        avail_uncommitted++;
-      }
     }
   }
 
@@ -664,10 +691,17 @@ __device__ __forceinline__ bool
     int32_t num_prefix_pages = config.pinned_req_num_prefix_pages[req_slot];
     int prefix_page_base = req_slot * MPK_MAX_PAGES_PER_REQ;
 
-    // Reserve the worst-case page budget this request can still need: a full
-    // page table minus the pages it imports. Every fresh page it later pops
-    // draws down the reservation, so it can never be outbid mid-flight.
+    // Admission gate. Reserve the worst-case page budget this request can
+    // still need — a full page table minus the pages it imports — before
+    // consuming anything: the ring slot stays ready=1 and the row stays free,
+    // so the request is simply retried next iteration once the CPU has
+    // returned enough pages. Every fresh page the row later pops draws down
+    // the reservation, so an admitted request can never be outbid mid-flight
+    // and the page queue can never underflow.
     int worst_need = MPK_MAX_PAGES_PER_REQ - num_prefix_pages;
+    if (avail_uncommitted < worst_need) {
+      break;
+    }
     avail_uncommitted -= worst_need;
 
     // Pop a free buffer row and copy inbox tokens from this ring slot.
@@ -747,11 +781,16 @@ __device__ __forceinline__ bool
   *config.gpu_comp_tail = gpu_comp_tail;
   *config.free_row_top = free_row_top;
   *config.avail_uncommitted = avail_uncommitted;
+  *config.gpu_return_head = gpu_return_head;
 
-  // Publish the free-page count so the CPU can reconcile what it has been
-  // handed against what the pool actually holds.
+  // Publish the free-page count and the return-ring head so the CPU can
+  // reconcile what it has returned against what the pool actually holds. Both
+  // mirrors lag the private cursors by at most one iteration, so a CPU-side
+  // occupancy estimate is always an upper bound.
   st_release_sys_i32(&config.pinned_page_free_count_mirror[0],
                      (int32_t)(page_queue_tail - page_queue_head));
+  st_release_sys_i32(&config.pinned_page_return_head_mirror[0],
+                     (int32_t)gpu_return_head);
 
   // If the batch is completely empty (no active requests, ring empty),
   // spin-wait instead of exiting so the kernel stays alive for future
