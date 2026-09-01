@@ -19,6 +19,7 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import runtime_kernel_paged_attention as rk
+from pytorch_reference import paged_attention_causal_ref
 
 NUM_KV_HEADS = 1
 NUM_QO_PER_KV = 8
@@ -59,16 +60,10 @@ def reference(qkv, k_cache, v_cache, window_size):
     k = torch.cat([gather(k_cache, prefix), k_new], dim=0)
     v = torch.cat([gather(v_cache, prefix), v_new], dim=0)
 
-    scores = torch.einsum("thd,sd->ths", q.float(), k.float()) / (HEAD_DIM ** 0.5)
-    key_pos = torch.arange(SEQ_LEN, device=qkv.device)
-    query_pos = torch.arange(prefix, SEQ_LEN, device=qkv.device)
-    keep = key_pos[None, :] <= query_pos[:, None]
-    if window_size > 0:
-        keep &= key_pos[None, :] > query_pos[:, None] - window_size
-
-    scores = scores.masked_fill(~keep[:, None, :], float("-inf"))
-    out = torch.einsum("ths,sd->thd", torch.softmax(scores, dim=-1), v.float())
-    return out.reshape(NUM_TOKENS, NUM_Q_HEADS * HEAD_DIM).to(qkv.dtype)
+    out = paged_attention_causal_ref(
+        q, k.unsqueeze(1), v.unsqueeze(1), window_size
+    )
+    return out.reshape(NUM_TOKENS, NUM_Q_HEADS * HEAD_DIM)
 
 
 def main():

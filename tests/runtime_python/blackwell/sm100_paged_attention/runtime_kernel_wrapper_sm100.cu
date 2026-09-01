@@ -21,6 +21,7 @@
 #include "blackwell/task_header.cuh"
 #include "common/bfloat16.h"
 #include "runtime_header.h"
+#include <cstdint>
 #include <cuda_runtime.h>
 #include <torch/extension.h>
 
@@ -50,7 +51,8 @@ __global__ void
                                   void const *q_norm_weight_ptr,
                                   void const *k_norm_weight_ptr,
                                   void const *cos_ptr,
-                                  void const *sin_ptr) {
+                                  void const *sin_ptr,
+                                  int16_t request_id) {
   kernel::multitoken_paged_attention_sm100_task_impl<bfloat16,
                                                      NUM_QO_PER_KV,
                                                      NUM_KV_HEADS,
@@ -73,7 +75,7 @@ __global__ void
       paged_kv_indptr_buffer_ptr,
       paged_kv_indices_buffer_ptr,
       paged_kv_last_page_len_buffer_ptr,
-      /*request_id*/ 0,
+      request_id,
       /*qk_norm*/ false,
       /*rope*/ true,
       q_norm_weight_ptr,
@@ -96,7 +98,8 @@ static void launch(torch::Tensor qkv,
                    torch::Tensor q_norm,
                    torch::Tensor k_norm,
                    torch::Tensor cos,
-                   torch::Tensor sin) {
+                   torch::Tensor sin,
+                   int64_t request_id) {
   size_t smem_size = mirage::runtime::MAX_DYNAMIC_SHARED_MEMORY_SIZE;
   cudaFuncSetAttribute(paged_attention_sm100_wrapper<WINDOW_SIZE>,
                        cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -114,7 +117,8 @@ static void launch(torch::Tensor qkv,
           q_norm.data_ptr(),
           k_norm.data_ptr(),
           cos.data_ptr(),
-          sin.data_ptr());
+          sin.data_ptr(),
+          static_cast<int16_t>(request_id));
 }
 
 // WINDOW_SIZE is a template parameter, so the dispatch enumerates the windows
@@ -133,7 +137,8 @@ static void paged_attention_sm100(torch::Tensor qkv,
                                   torch::Tensor k_norm,
                                   torch::Tensor cos,
                                   torch::Tensor sin,
-                                  int64_t window_size) {
+                                  int64_t window_size,
+                                  int64_t request_id) {
 #define DISPATCH(W)                                                            \
   case W:                                                                      \
     launch<W>(qkv,                                                             \
@@ -147,7 +152,8 @@ static void paged_attention_sm100(torch::Tensor qkv,
               q_norm,                                                          \
               k_norm,                                                          \
               cos,                                                             \
-              sin);                                                            \
+              sin,                                                             \
+              request_id);                                                     \
     break;
   switch (window_size) {
     DISPATCH(0)
@@ -160,7 +166,23 @@ static void paged_attention_sm100(torch::Tensor qkv,
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  // request_id indexes the qo / kv indptr buffers, so a test can place the
+  // request under test behind other requests and give it first_page_pos > 0.
   m.def("paged_attention_sm100",
         &paged_attention_sm100,
-        "Paged attention SM100 with an explicit page table");
+        "Paged attention SM100 with an explicit page table",
+        pybind11::arg("qkv"),
+        pybind11::arg("k_cache"),
+        pybind11::arg("v_cache"),
+        pybind11::arg("output"),
+        pybind11::arg("qo_indptr"),
+        pybind11::arg("kv_indptr"),
+        pybind11::arg("kv_indices"),
+        pybind11::arg("kv_last_page_len"),
+        pybind11::arg("q_norm"),
+        pybind11::arg("k_norm"),
+        pybind11::arg("cos"),
+        pybind11::arg("sin"),
+        pybind11::arg("window_size"),
+        pybind11::arg("request_id") = 0);
 }

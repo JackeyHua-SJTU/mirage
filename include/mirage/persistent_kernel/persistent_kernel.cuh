@@ -219,6 +219,17 @@ __global__ void prepare_kernel(RuntimeConfig config,
   }
 }
 
+// paged_kv_last_page_len is 1-based: it lives in [1, MPK_PAGE_SIZE] and is
+// never 0, because every attention task rebuilds the sequence length as
+// (num_pages - 1) * PAGE_SIZE + last_page_len. A bare "% MPK_PAGE_SIZE" reports
+// 0 when the KV length lands exactly on a page boundary, which silently drops a
+// whole page from seq_len (at PAGE_SIZE=64 with mbt=8 that happens on every
+// eighth prefill iteration).
+__device__ __forceinline__ int paged_kv_last_page_len(int kv_len) {
+  int const rem = kv_len % MPK_PAGE_SIZE;
+  return (rem == 0) ? MPK_PAGE_SIZE : rem;
+}
+
 #ifdef MODE_OFFLINE
 // TODO: parallelize this processing
 __device__ __forceinline__ bool
@@ -334,11 +345,8 @@ __device__ __forceinline__ bool
       // Prepare page indptrs
       int num_new_pages =
           (step + num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
-      {
-        int _lpl = (step + num_new_tokens) % MPK_PAGE_SIZE;
-        config.paged_kv_last_page_len_buffer[num_reqs] =
-            (_lpl == 0) ? MPK_PAGE_SIZE : _lpl;
-      }
+      config.paged_kv_last_page_len_buffer[num_reqs] =
+          paged_kv_last_page_len(step + num_new_tokens);
       for (int j = 0; j < num_old_pages; j++) {
         config.paged_kv_indices_buffer[num_pages + j] =
             config.paged_kv_indices_snapshot[kv_indptr + j];
@@ -373,11 +381,8 @@ __device__ __forceinline__ bool
           config.tokens[next_request_id * MPK_MAX_SEQ_LENGTH + j];
     }
     int num_new_pages = (num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
-    {
-      int _lpl = num_new_tokens % MPK_PAGE_SIZE;
-      config.paged_kv_last_page_len_buffer[num_reqs] =
-          (_lpl == 0) ? MPK_PAGE_SIZE : _lpl;
-    }
+    config.paged_kv_last_page_len_buffer[num_reqs] =
+        paged_kv_last_page_len(num_new_tokens);
     for (int j = 0; j < num_new_pages; j++) {
       config.paged_kv_indices_buffer[num_pages + j] =
           config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
@@ -591,7 +596,7 @@ __device__ __forceinline__ bool
     int num_new_pages =
         (step + num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
     config.paged_kv_last_page_len_buffer[num_reqs] =
-        (step + num_new_tokens) % MPK_PAGE_SIZE;
+        paged_kv_last_page_len(step + num_new_tokens);
 
     for (int j = 0; j < num_old_pages; j++) {
       config.paged_kv_indices_buffer[num_pages + j] =
@@ -659,7 +664,7 @@ __device__ __forceinline__ bool
     int num_new_pages =
         (initial_step + num_new_tokens + MPK_PAGE_SIZE - 1) / MPK_PAGE_SIZE;
     config.paged_kv_last_page_len_buffer[num_reqs] =
-        (initial_step + num_new_tokens) % MPK_PAGE_SIZE;
+        paged_kv_last_page_len(initial_step + num_new_tokens);
 
     for (int j = 0; j < num_new_pages; j++) {
       config.paged_kv_indices_buffer[num_pages + j] =

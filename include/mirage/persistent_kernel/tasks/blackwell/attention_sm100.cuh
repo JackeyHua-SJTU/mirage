@@ -118,6 +118,10 @@ __device__ __forceinline__ void multitoken_paged_attention_sm100_task_impl(
     int const first_page_pos = paged_kv_indptr_buffer_ptr[request_id];
     int const last_page_pos = paged_kv_indptr_buffer_ptr[request_id + 1];
     int const num_pages = last_page_pos - first_page_pos;
+    // last_page_len is 1-based (in [1, PAGE_SIZE], never 0) -- see
+    // paged_kv_last_page_len() in persistent_kernel.cuh. Do not clamp it again
+    // here; a producer that already clamps plus a consumer that re-corrects
+    // would over-count a page whenever the KV length is a page multiple.
     int const seq_len = (num_pages - 1) * PAGE_SIZE +
                         paged_kv_last_page_len_buffer_ptr[request_id] -
                         TAIL_OFFSET;
