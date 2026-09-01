@@ -127,6 +127,42 @@ def test_unbounded_publish_pins_deadlock_admission():
         sim_mod.scenario_publish_pin_deadlock(bug="no_publish_clamp")
 
 
+# ── §6.4 v2.1-c′: backpressure must be attributed to pages ────────────────
+
+
+def test_row_starvation_never_force_evicts():
+    """The P2 misfire: with every row busy the ring head stalls, but the pool
+    is nearly empty, so evicting buys nothing and must not happen."""
+    sim = sim_mod.scenario_row_starvation()
+    assert sim.stats["backpressure_suppressed"] > 0  # the stall really happened
+    assert sim.stats["forced_evictions"] == 0
+    assert sim.stats["evictions"] == 0
+
+
+def test_unattributed_backpressure_strips_the_cache_on_row_starvation():
+    """Documents why the attribution exists: the pre-v2.1-c′ rule reacts to the
+    same row-starved stall by force-evicting blocks that were never the
+    problem — measured on hardware as 163 blocks in 0.8 s."""
+    sim = sim_mod.scenario_row_starvation(bug="unattributed_backpressure")
+    assert sim.stats["forced_evictions"] > 0
+
+
+def test_page_starvation_still_force_evicts():
+    """The other half: the pool really is what the ring head waits for, so the
+    stalled-head rule must still fire and hand blocks back."""
+    sim = sim_mod.scenario_page_starvation()
+    assert sim.stats["backpressure_fired"] > 0
+    assert sim.stats["forced_evictions"] > 0
+    assert sim.stats["completions"] == 2
+
+
+def test_without_backpressure_page_starvation_wedges_admission():
+    """And why that half must stay: cached pages hold avail_uncommitted down
+    1:1, so a cache that never reacts parks admission forever (§6.4 v2.1-c)."""
+    with pytest.raises(LivenessViolation):
+        sim_mod.scenario_page_starvation(bug="no_backpressure")
+
+
 # ── the checker must actually bite ────────────────────────────────────────
 
 

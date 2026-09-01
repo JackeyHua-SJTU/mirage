@@ -20,13 +20,15 @@ Modelled design = the amended (v2) one from §6 of the design doc:
     step23   compact the batch and grow page tables from the free queue
     step4    admission gated by the page ledger, two-phase page-table fill
              (imported prefix pages, then fresh pops), late ring-slot clear
-    step56   clear unused slots, write cursors back, publish return-head mirror
+    step56   clear unused slots, write cursors back, publish the return-head
+             and free-page-count mirrors
     exec     the "forward pass": KV writes + one output token per input token
 
   CPU (single owner thread, one atomic step per stage, round-robin)
     drain    one completion: unconditional page accounting, then the row ack
              is queued (the row lease is held until the ack stage)
-    evict    LRU / refcount==0 / leaf-first eviction into the return ring
+    evict    LRU / refcount==0 / leaf-first eviction into the return ring;
+             force-eviction needs a stalled ring head AND a page attribution
     publish  match-at-publish: lookup + refcount++ + prefix array + ready=1 as
              ONE atomic step; parked (unpublished) requests hold nothing
     ack      write pinned_step[row] = -1 after re-reading the leased row
@@ -122,6 +124,9 @@ BUGS = {
     "no_publish_clamp": "no bound on prefix pins held by unadmitted requests",
     "raw_last_page_len": "last_page_len via a bare % (missing the A10.1 fix)",
     "ids_only_match": "cache lookup compares block ids without the parent link",
+    "unattributed_backpressure": "backpressure fires on any stalled ring head "
+                                 "(the pre-v2.1-c′ rule, misfires on row starvation)",
+    "no_backpressure": "the cache never reacts to a stalled ring head",
 }
 
 
@@ -190,6 +195,11 @@ class Fabric:
         self.ret_ring = [-1] * self.ret_cap
         self.ret_tail = 0
         self.ret_head_mirror = 0
+        # Free-page count mirror (GPU -> CPU): page_queue_tail - page_queue_head
+        # as of the end of the GPU's last iteration.  With ret_head_mirror this
+        # is the CPU's only view of the pool, and the input to the page
+        # attribution of backpressure (§6.4 v2.1-c′).
+        self.free_count_mirror = cfg.total_pages
 
 
 class GPU:
@@ -479,7 +489,7 @@ class GPU:
                 f"avail={self.avail_uncommitted}"
             )
 
-    # ── Steps 5+6: clear unused slots, write cursors back ─────────────────
+    # ── Steps 5+6: clear unused slots, write cursors back, publish mirrors ─
 
     def _step56(self) -> None:
         cfg = self.cfg
@@ -490,6 +500,7 @@ class GPU:
             self.qo_indptr[i] = self.num_tokens
             self.kv_indptr[i] = self.num_pages
         self.fab.ret_head_mirror = self.ret_head  # published for CPU accounting
+        self.fab.free_count_mirror = self.pq_tail - self.pq_head
 
     # ── the forward pass: KV writes and one output token per input token ──
 
@@ -685,10 +696,11 @@ class CPU:
                 self._stall_head, self._stall_ticks = head, 0
         else:
             self._stall_head, self._stall_ticks = -1, 0
-        if self._stall_ticks >= self.cfg.stall_ticks:
-            # Backpressure: the ring head is not being admitted, so release the
-            # pool one block at a time until it is (the CPU cannot see the
-            # GPU's free count, so it walks the watermark down gradually).
+        forced = self._stall_ticks >= self.cfg.stall_ticks and self._backpressure()
+        if forced:
+            # Backpressure: the ring head is not being admitted *and the pool is
+            # why*, so release it one block at a time until it is (the CPU sees
+            # only a lagging free-count mirror, so it walks down gradually).
             target = max(0, len(self.blocks) - 1)
         else:
             target = self.cache_budget
@@ -702,8 +714,42 @@ class CPU:
             self._push_return(victim.page)
             evicted += 1
             self.sim.stats["evictions"] += 1
+            if forced:
+                self.sim.stats["forced_evictions"] += 1
         if evicted:
             self.sim.trace_add(f"cpu.evict n={evicted} cached={len(self.blocks)}")
+
+    def _backpressure(self) -> bool:
+        """Is the stalled ring head stalled on *pages*? (§6.4 v2.1-c′)
+
+        A stall alone does not justify force-evicting: the head can equally be
+        waiting for a free row, and no amount of eviction produces one.  P2
+        measured that misfire on hardware — 12 in-flight requests on 4 rows,
+        47–56 of 64 pages free, 1061 backpressure ticks in 0.8 s, 163 blocks
+        force-evicted for nothing.  So the trigger also requires the CPU's own
+        estimate of the pool to be short of what the GPU's admission gate wants
+        for the head.
+
+        Both inputs are deliberately loose in the same direction.  The estimate
+        (free-count mirror + pages still in the return ring) is an *upper* bound
+        on ``avail_uncommitted``: it cannot see the reservations held by
+        admitted rows.  The need is therefore also taken at its upper bound —
+        the whole ``pages_per_req``, i.e. the need of a head that matched
+        nothing — even though the CPU published the head's npp and could
+        subtract it.  Under-firing wedges admission; over-firing costs a block.
+        """
+        cfg = self.cfg
+        if cfg.bug == "no_backpressure":
+            return False
+        if cfg.bug == "unattributed_backpressure":
+            return True  # the pre-v2.1-c′ rule: any stalled head fires
+        fab = self.fab
+        free_estimate = fab.free_count_mirror + (fab.ret_tail - fab.ret_head_mirror)
+        if free_estimate < cfg.pages_per_req:
+            self.sim.stats["backpressure_fired"] += 1
+            return True
+        self.sim.stats["backpressure_suppressed"] += 1
+        return False
 
     # ── stage: match-at-publish (one atomic step) ─────────────────────────
 
@@ -961,7 +1007,8 @@ class Sim:
             f"comp_ring = ready={self.fab.comp_ready} tail={gpu.gpu_comp_tail} "
             f"head={cpu.cpu_comp_head}",
             f"ret_ring  = head={gpu.ret_head} tail={self.fab.ret_tail} "
-            f"pending={ret_pending}",
+            f"pending={ret_pending} head_mirror={self.fab.ret_head_mirror} "
+            f"free_mirror={self.fab.free_count_mirror}",
             f"cache     = {cache_view}",
             "--- last events ---",
         ]
@@ -1075,6 +1122,10 @@ class Sim:
             belongs to that rid and holds its prompt and its generated tokens.
         I8  the attention-visible sequence length derived from the page table
             equals the true KV length (checked in GPU._exec).
+        I9  the CPU's free-page estimate (free-count mirror + pages still in
+            the return ring) is an upper bound on avail_uncommitted -- which is
+            what makes the page attribution of backpressure conservative in the
+            safe direction (§6.4 v2.1-c′).
         """
         cfg, gpu, cpu, fab = self.cfg, self.gpu, self.cpu, self.fab
 
@@ -1161,6 +1212,19 @@ class Sim:
         # so the CPU's occupancy estimate is always an upper bound.
         if not fab.ret_head_mirror <= gpu.ret_head <= fab.ret_tail:
             self.violation("I5", "return-ring head mirror ran ahead of the head")
+        # I9: since the last mirror publish the free queue can only have grown
+        # by pages the GPU drained out of the return ring -- which the CPU's
+        # (tail - head_mirror) term already counts -- so the estimate never
+        # undercounts what the GPU could still hand out.  Backpressure suppresses
+        # itself on this estimate, and suppressing a real page stall would wedge
+        # admission, so the bound has to hold at every step, not on average.
+        estimate = fab.free_count_mirror + (fab.ret_tail - fab.ret_head_mirror)
+        if estimate < gpu.avail_uncommitted:
+            self.violation(
+                "I9",
+                f"CPU free estimate {estimate} < avail_uncommitted "
+                f"{gpu.avail_uncommitted} (mirror={fab.free_count_mirror})",
+            )
 
     def check_quiesced(self) -> None:
         """I6: conservation once everything has drained."""
@@ -1300,6 +1364,9 @@ def run_config(cfg: Config, seed: int, events: int, verbose: bool = True) -> Sim
             f"hit={sim.stats['hits']:<4} hit_tok={sim.stats['hit_tokens']:<5} "
             f"ins={sim.stats['inserts']:<4} dedup={sim.stats['dedupes']:<4} "
             f"evict={sim.stats['evictions']:<4} "
+            f"forced={sim.stats['forced_evictions']:<4} "
+            f"bp={sim.stats['backpressure_fired']}/"
+            f"{sim.stats['backpressure_suppressed']:<6} "
             f"defer={sim.stats['admission_deferred']:<5} "
             f"max_stall={sim.max_stall}"
         )
@@ -1482,6 +1549,90 @@ def scenario_wrong_prefix_hit(bug: str = "", seed: int = 6) -> Sim:
     return sim
 
 
+def scenario_row_starvation(bug: str = "", seed: int = 7) -> Sim:
+    """Rows exhausted, pages plentiful: backpressure must NOT force-evict.
+
+    One row, a 64-page pool and a request that runs to max_seq, so the next
+    request sits on the ring head unadmitted for as long as the batch is full
+    while ~7/8 of the pool is free.  This is the shape P2 measured on hardware
+    (12 in flight on 4 rows, 47-56/64 pages free, 1061 backpressure ticks in
+    0.8 s, 163 blocks force-evicted): eviction cannot buy a row, so the only
+    thing the pre-v2.1-c′ rule bought was an empty cache.  With the page
+    attribution the whole stall must pass without a single forced eviction.
+    """
+    cfg = Config(
+        name="row-starve",
+        rows=1,
+        total_pages=64,
+        max_prompt=40,
+        stall_ticks=3,
+        bug=bug,
+    )
+    sim = Sim(cfg, seed=seed)
+    # Warm two independent chains so force-eviction would have victims to take.
+    for tag in (0, 1):
+        tokens = _aligned_prompt(sim, blocks=2, extra=1, tag=tag)
+        sim.step_submit(sim.make_request(tokens, eos_at=len(tokens) + 1))
+        sim.drive_until(
+            lambda: not sim.cpu.published and not sim.cpu.pending_submits,
+            max_events=60_000,
+        )
+    assert len(sim.cpu.blocks) == 4, f"warm-up cached {len(sim.cpu.blocks)} blocks"
+    warm_pages = {b.page for b in sim.cpu.blocks}
+
+    # A long-runner takes the only row; a cold request then heads the ring.
+    hog = _aligned_prompt(sim, blocks=2, extra=1, tag=5)
+    sim.step_submit(sim.make_request(hog, eos_at=None))  # runs to max_seq
+    sim.drive_until(lambda: sim.gpu.free_row_top == 0, max_events=60_000)
+    cold = _aligned_prompt(sim, blocks=1, extra=1, tag=6)
+    sim.step_submit(sim.make_request(cold, eos_at=len(cold) + 1))
+    sim.drive_until(lambda: sim.stats["completions"] == 4, max_events=200_000)
+    sim.quiesce()
+    assert sim.stats["backpressure_suppressed"] > 0 or bug, (
+        "the schedule never stalled the ring head, so it proves nothing"
+    )
+    if not bug:
+        assert sim.stats["forced_evictions"] == 0, "row starvation force-evicted"
+        assert sim.stats["evictions"] == 0, "a page was evicted with the pool idle"
+        assert warm_pages <= {b.page for b in sim.cpu.blocks}, "the cache was stripped"
+    return sim
+
+
+def scenario_page_starvation(bug: str = "", seed: int = 8) -> Sim:
+    """Rows free, pool exhausted: backpressure MUST force-evict.
+
+    The pool is exactly one worst-case request, so the cached blocks of the
+    first request are precisely what keeps the second (which matched nothing,
+    and so needs the whole worst case) below the GPU's admission gate.  Nothing
+    completes to release them and the capacity budget is not exceeded, so the
+    only thing that can unblock admission is the stalled-head rule firing.
+    """
+    cfg = Config(
+        name="page-starve",
+        total_pages=8,
+        max_prompt=32,
+        cache_budget=4,
+        stall_ticks=3,
+        stall_limit=4000,
+        bug=bug,
+    )
+    sim = Sim(cfg, seed=seed)
+    warm = _aligned_prompt(sim, blocks=2, extra=1, tag=0)
+    sim.step_submit(sim.make_request(warm, eos_at=len(warm) + 1))
+    sim.drive_until(
+        lambda: sim.stats["completions"] == 1 and not sim.cpu.published,
+        max_events=60_000,
+    )
+    assert len(sim.cpu.blocks) == 2, f"warm-up cached {len(sim.cpu.blocks)} blocks"
+    cold = [700 + i for i in range(20)]  # npp=0: needs the whole pool
+    sim.step_submit(sim.make_request(cold, eos_at=len(cold) + 1))
+    sim.drive_until(lambda: sim.stats["completions"] == 2, max_events=200_000)
+    sim.quiesce()
+    assert sim.stats["forced_evictions"] > 0, "admission unblocked without eviction"
+    assert sim.stats["backpressure_fired"] > 0
+    return sim
+
+
 SCENARIOS = {
     "toctou": scenario_toctou,
     "duplicates": scenario_duplicate_prompts,
@@ -1489,6 +1640,8 @@ SCENARIOS = {
     "full-pool-churn": scenario_full_pool_churn,
     "publish-pin-deadlock": scenario_publish_pin_deadlock,
     "wrong-prefix-hit": scenario_wrong_prefix_hit,
+    "row-starvation": scenario_row_starvation,
+    "page-starvation": scenario_page_starvation,
 }
 
 

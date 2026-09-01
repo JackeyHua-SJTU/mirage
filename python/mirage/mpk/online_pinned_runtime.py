@@ -60,9 +60,10 @@ from .prefix_cache import EMPTY_MATCH, Block, PrefixCache, PrefixMatch
 logger = logging.getLogger(__name__)
 
 # Owner ticks (≈0.2 ms each) the oldest published request may stay unadmitted
-# before the cache starts handing the page pool back one block at a time
-# (§6.4 v2.1-c).  50 ticks ≈ 10 ms is an order of magnitude above one kernel
-# iteration, so a merely busy GPU never trips it.
+# before the cache starts handing the page pool back one block at a time --
+# and then only if the pool is what it is waiting for (§6.4 v2.1-c′).  50 ticks
+# ≈ 10 ms is an order of magnitude above one kernel iteration, so a merely busy
+# GPU never trips it.
 PREFIX_CACHE_STALL_TICKS = 50
 
 
@@ -401,17 +402,37 @@ class OnlinePinnedRuntime:
             self._unadmitted.popleft()
 
     def _cache_tick(self) -> None:
-        """Trim the cache to budget and react to a stalled ring head.
+        """Trim the cache to budget and react to a *page-starved* ring head.
 
         Resident pages hold the GPU's ``avail_uncommitted`` down 1:1 and the
         GPU has no "I am starving" channel, so a cache that never reacts to an
         unadmitted ring head can park admission indefinitely without breaking
-        any invariant (§6.4 v2.1-c).
+        any invariant (§6.4 v2.1-c).  But a head can also sit unadmitted because
+        every row is busy, and evicting cannot buy a row: P2 measured 1061
+        backpressure ticks in 0.8 s with 47-56 of 64 pages free, which cost 163
+        blocks and bought nothing.  So the stall is paired with an attribution
+        the owner can compute from the mirrors it already reads (§6.4 v2.1-c′).
+
+        ``head_worst_need`` is the whole ``max_pages_per_req``, not
+        ``max_pages_per_req - npp_head``, even though the head's npp is known
+        here: ``free_estimate`` is an upper bound on ``avail_uncommitted`` (it
+        cannot see the reservations held by admitted requests), so it is paired
+        with an upper bound on the need.  An attribution that is too tight would
+        suppress a genuinely page-starved stall and wedge admission; one that is
+        too loose only lets a redundant eviction through.
         """
         if self._cache is None:
             return
-        oldest = self._unadmitted[0].rid if self._unadmitted else None
-        self._return_pages_locked(self._cache.tick(oldest))
+        oldest = None
+        free_estimate = None
+        if self._unadmitted:
+            oldest = self._unadmitted[0].rid
+            free_estimate = self.gpu_free_page_count + self.pending_page_returns
+        self._return_pages_locked(self._cache.tick(
+            oldest,
+            free_estimate=free_estimate,
+            head_worst_need=self._pages_per_req,
+        ))
 
     def _reap_completions(self) -> List[Tuple[int, int, int]]:
         """Collect every completion the GPU has published since the last tick."""

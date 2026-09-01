@@ -27,7 +27,8 @@ Usage from the owner thread::
     ...
     free = cache.insert(prompt_ids, exported_pages, final_step, gen_tail_len,
                         num_prefix_pages=match.num_prefix_pages)
-    free += cache.tick(oldest_unadmitted_rid)
+    free += cache.tick(oldest_unadmitted_rid, free_estimate=free_pages_seen,
+                       head_worst_need=max_pages_per_req)
     runtime.return_pages(free)
 """
 
@@ -44,7 +45,8 @@ from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tu
 MAX_EVICTIONS_PER_TICK = 32
 
 # Owner ticks the oldest published request may stay unadmitted before the cache
-# starts giving the pool back one block at a time (§6.4 v2.1-c).
+# starts giving the pool back one block at a time -- and only if the stall is
+# attributable to pages (§6.4 v2.1-c′).
 DEFAULT_STALL_TICKS = 16
 
 
@@ -268,15 +270,47 @@ class PrefixCache:
         self._counts["evicted"] += len(pages)
         return pages
 
-    def tick(self, oldest_unadmitted=None) -> List[int]:
+    def tick(
+        self,
+        oldest_unadmitted=None,
+        free_estimate: Optional[int] = None,
+        head_worst_need: Optional[int] = None,
+    ) -> List[int]:
         """One owner-thread cache tick; returns pages for the return ring.
 
-        Trims to the capacity budget, and — while *oldest_unadmitted* names the
-        same published request for ``stall_ticks`` consecutive ticks — gives one
-        extra block back per tick (§6.4 v2.1-c).  Resident pages hold
-        ``avail_uncommitted`` down 1:1 and the GPU has no "I am starving"
-        channel, so a cache that never reacts to a stalled ring head can park
-        admission indefinitely without breaking any invariant.
+        Always trims to the capacity budget.  On top of that it force-evicts one
+        extra block per tick while **both** halves of the §6.4 v2.1-(c′) rule
+        hold:
+
+        1. *oldest_unadmitted* names the same published request for
+           ``stall_ticks`` consecutive ticks.  Resident pages hold the GPU's
+           ``avail_uncommitted`` down 1:1 and the GPU has no "I am starving"
+           channel, so a cache that never reacts to a stalled ring head can park
+           admission indefinitely without breaking any invariant (v2.1-c).
+        2. The stall is **attributable to pages**: *free_estimate* — the pages
+           the caller believes the GPU could still hand out — is below
+           *head_worst_need*, the pages the GPU's admission gate wants before it
+           will admit that head.
+
+        Condition 1 alone cannot tell page starvation from ROW/batch starvation,
+        and the difference matters: no amount of eviction buys a free row.  P2
+        measured the misfire on hardware — 12 in-flight requests on 4 rows with
+        47–56 of 64 pages free fired backpressure 1061 times in 0.8 s and
+        force-evicted 163 blocks, stripping the cache to the pinned chains for
+        nothing.  Condition 2 suppresses exactly that case and counts it as
+        ``backpressure_suppressed``.
+
+        *free_estimate* is expected to be an upper bound on what the GPU can
+        allocate (a free-page mirror plus in-flight returns ignores the
+        reservations already made for admitted requests), so the caller should
+        pair it with an upper bound on the need — ``max_pages_per_req``, the
+        need of a head that matched nothing — rather than a tight one.  Failing
+        to fire when the stall really is page-caused is a wedged pipeline;
+        firing once too often only costs a block.  That is also why omitting
+        *free_estimate* (a caller with no view of the pool) keeps the
+        unattributed v2.1-c behaviour of firing on the stall alone; passing
+        *free_estimate* without *head_worst_need* compares against
+        ``max_pages_per_req``.
         """
         if oldest_unadmitted is not None and oldest_unadmitted == self._stall_key:
             self._stalled_for += 1
@@ -285,11 +319,23 @@ class PrefixCache:
             self._stalled_for = 0
         over = len(self._blocks) - self._capacity_pages
         if oldest_unadmitted is not None and self._stalled_for >= self._stall_ticks:
-            over = max(over, 1)
-            self._counts["backpressure_ticks"] += 1
+            if self._page_starved(free_estimate, head_worst_need):
+                over = max(over, 1)
+                self._counts["backpressure_ticks"] += 1
+            else:
+                self._counts["backpressure_suppressed"] += 1
         if over <= 0:
             return []
         return self.evict(min(over, MAX_EVICTIONS_PER_TICK))
+
+    def _page_starved(
+        self, free_estimate: Optional[int], head_worst_need: Optional[int]
+    ) -> bool:
+        """Is the pool, not the batch, what the stalled ring head is waiting on?"""
+        if free_estimate is None:
+            return True  # no attribution channel: fall back to v2.1-c
+        need = self._max_pages_per_req if head_worst_need is None else head_worst_need
+        return free_estimate < need
 
     def reset(self) -> List[int]:
         """Drop the whole index (kernel restart) and return every resident page."""
@@ -309,6 +355,11 @@ class PrefixCache:
 
         ``hits``/``misses`` count publishes, not pages: a match clamped to zero
         by the pin budget counts as a miss, since that is what was published.
+        ``backpressure_ticks`` and ``backpressure_suppressed`` split the
+        stalled-head ticks by page attribution (§6.4 v2.1-c′): the first evicted
+        to unblock admission, the second decided the head was waiting on a row
+        rather than a page and left the cache alone.  A ratio that leans hard on
+        ``backpressure_suppressed`` is healthy — it is the misfire not happening.
         """
         snapshot = {
             "hits": 0,
@@ -318,6 +369,7 @@ class PrefixCache:
             "deduped": 0,
             "evicted": 0,
             "backpressure_ticks": 0,
+            "backpressure_suppressed": 0,
             "unpin_underflow": 0,
         }
         snapshot.update(self._counts)

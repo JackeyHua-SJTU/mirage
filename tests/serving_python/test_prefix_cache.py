@@ -342,6 +342,81 @@ def test_tick_trims_to_capacity_and_backpressures():
     assert cache.tick(oldest_unadmitted=8) == []
 
 
+# ── §6.4 v2.1-c′: backpressure must be attributed to pages ────────────────
+
+
+def stall(cache, rid=7, ticks=None, **attribution):
+    """Tick until *rid* has headed the ring long enough to trip backpressure."""
+    freed = []
+    if ticks is None:
+        ticks = prefix_cache.DEFAULT_STALL_TICKS + 1
+    for _ in range(ticks):
+        freed += cache.tick(oldest_unadmitted=rid, **attribution)
+    return freed
+
+
+def test_row_starvation_suppresses_backpressure():
+    """Head stalled, pool nearly empty: the batch is full, and no eviction can
+    buy a row.  This is the P2 misfire — 12 in flight on 4 rows with 47-56/64
+    pages free burned 1061 backpressure ticks and 163 blocks (§6.4 v2.1-c′)."""
+    cache, pool = make_cache(capacity_pages=8, max_pages_per_req=8), Pool(64)
+    for tag in range(3):
+        run_request(cache, pool, prompt_of(2, tag=tag))
+    assert cache.resident_pages == 6
+
+    freed = stall(cache, free_estimate=53, head_worst_need=8)
+    assert freed == [], "force-evicted while 53 pages were free"
+    assert cache.resident_pages == 6
+    stats = cache.stats()
+    assert stats["backpressure_suppressed"] > 0  # the stall was seen ...
+    assert stats["backpressure_ticks"] == 0  # ... and attributed to rows
+    assert stats["evicted"] == 0
+
+
+def test_page_starvation_still_backpressures():
+    """The same stall with the pool actually short still hands blocks back."""
+    cache, pool = make_cache(capacity_pages=8, max_pages_per_req=8), Pool(64)
+    for tag in range(3):
+        run_request(cache, pool, prompt_of(2, tag=tag))
+
+    pool.give(stall(cache, free_estimate=3, head_worst_need=8))
+    assert cache.resident_pages == 5, "the stalled head freed no block"
+    stats = cache.stats()
+    assert stats["backpressure_ticks"] == 1 and stats["backpressure_suppressed"] == 0
+    # One block per tick, so the pool comes back gradually rather than at once.
+    for expected in (4, 3, 2):
+        pool.give(cache.tick(oldest_unadmitted=7, free_estimate=3, head_worst_need=8))
+        assert cache.resident_pages == expected
+
+
+def test_attribution_defaults_are_conservative():
+    """No estimate at all falls back to firing; an estimate with no explicit
+    need is compared against the worst case, ``max_pages_per_req``."""
+    cache, pool = make_cache(capacity_pages=8, max_pages_per_req=8), Pool(64)
+    for tag in range(3):
+        run_request(cache, pool, prompt_of(2, tag=tag))
+
+    pool.give(stall(cache))  # no attribution channel: v2.1-c behaviour
+    assert cache.stats()["backpressure_ticks"] == 1
+    # free_estimate alone: 8 free is exactly one worst-case request, not short.
+    pool.give(stall(cache, rid=9, free_estimate=8))
+    assert cache.stats()["backpressure_suppressed"] == 1
+    pool.give(stall(cache, rid=10, free_estimate=7))
+    assert cache.stats()["backpressure_ticks"] == 2
+
+
+def test_capacity_trimming_is_unaffected_by_the_attribution():
+    """Over-budget trimming is not backpressure: it runs whatever the pool
+    looks like, and only the extra forced block is attributed."""
+    cache, pool = make_cache(capacity_pages=2, max_pages_per_req=8), Pool(64)
+    for tag in range(3):
+        run_request(cache, pool, prompt_of(2, tag=tag))
+    assert cache.resident_pages == 6
+    pool.give(stall(cache, ticks=1, free_estimate=64, head_worst_need=8))
+    assert cache.resident_pages == 2  # trimmed to budget, nothing forced
+    assert cache.stats()["backpressure_ticks"] == 0
+
+
 # ── §6.4 v2.1-a: publish pin budget ───────────────────────────────────────
 
 
