@@ -20,8 +20,14 @@ Each ring slot has its own independent pinned inbox buffer, so concurrent
 submits can write prompt tokens without overwriting each other.  The GPU
 copies inbox tokens to the assigned buffer row when admitting a request.
 
-When the batch and ring are full, requests queue on the CPU side in a
-``collections.deque`` and are flushed into the ring as slots free up.
+A single *owner thread* drives both rings.  :meth:`submit` only appends
+``(rid, token_ids, initial_step)`` to a CPU-side admission deque; every owner
+tick then reaps completions (page accounting, page return) and publishes as
+many queued requests as the ring has free slots.  Request threads never touch
+the request ring, so the ring publish -- and, once the prefix cache is wired
+in, the match/insert/evict that must be atomic with it -- happen on one thread
+with no lock hierarchy to get wrong.  The price is up to one tick (0.2 ms) of
+admission latency, which is noise next to a kernel iteration.
 
 Usage::
 
@@ -30,6 +36,9 @@ Usage::
     runtime.submit(rid=1, token_ids=[...])
     buffer_row, final_step = runtime.wait_for_request(rid=0, timeout=60)
     tokens = runtime.read_tokens_at_row(buffer_row, final_step)
+
+Without :meth:`start` there is no owner thread, and :meth:`wait_for_request`
+drives the ticks itself, so the snippet above works single-threaded too.
 """
 
 import collections
@@ -101,93 +110,99 @@ class OnlinePinnedRuntime:
         self._cpu_req_ack   = 0  # last slot known to be consumed by GPU
         self._cpu_comp_head = 0
 
-        # CPU-side waiting queue: holds (rid, token_ids, initial_step) tuples
-        # that could not be written to the ring because it was full.
-        self._waiting: Deque[Tuple[int, torch.Tensor, int]] = collections.deque()
-        self._waiting_lock = threading.Lock()
+        # CPU-side admission queue: every submitted request lands here first
+        # and is published by the owner thread.  Holding a request here costs
+        # nothing -- no ring slot, no page pin -- so a queued request can never
+        # wedge admission.
+        self._admission: Deque[Tuple[int, torch.Tensor, int]] = collections.deque()
+        self._admission_lock = threading.Lock()
 
         # Dedicated stream for HtoD / DtoH copies.
         self._write_stream = torch.cuda.Stream(device=mpk.tokens.device)
 
-        # Serialises ring-slot reservation between submit() and flush_waiting().
-        # Without this lock the two callers can claim the same slot (they both
-        # read _cpu_req_tail outside any shared critical section), creating a
-        # hole in the request ring.  The GPU stops draining at the first
-        # ready==0 slot, so the hole permanently blocks every entry behind it.
-        self._ring_lock = threading.Lock()
+        # Serialises one owner tick against another.  The owner thread is
+        # normally the only ticker, but a driver running without one polls
+        # through drain_completions(); this lock keeps the two strictly
+        # exclusive so the request ring and the page-return ring keep their
+        # single producer either way.
+        self._owner_lock = threading.Lock()
 
         # Completion tracking: rid → (buffer_row, final_step)
         self._completions: Dict[int, Tuple[int, int]] = {}
         self._abandoned: set[int] = set()
+        # rid → the exception that stopped it from ever being published.
+        self._failed: Dict[int, Exception] = {}
         self._lock = threading.RLock()
 
-        # The drain thread starts only after reset() has initialized all shared
+        # The owner thread starts only after reset() has initialized all shared
         # state. Starting it here races reset() and can corrupt ring cursors.
-        self._drain_stop = threading.Event()
-        self._drain_thread: threading.Thread | None = None
+        self._owner_stop = threading.Event()
+        self._owner_thread: threading.Thread | None = None
+        # Fail-closed latch. Named for the drain half of the owner tick it has
+        # always guarded: an owner that dies still makes every later caller --
+        # submit included -- raise at once instead of queueing into a void.
         self._drain_error: Exception | None = None
 
     # ── Public API ────────────────────────────────────────────────────────
 
-    def submit(self, rid: int, token_ids: torch.Tensor, initial_step: int = 0) -> bool:
-        """Stage prompt tokens and write a request into the CPU→GPU ring.
+    def submit(self, rid: int, token_ids: torch.Tensor, initial_step: int = 0) -> None:
+        """Queue a request for the owner thread to publish.
 
-        Writes tokens to the slot-specific inbox so concurrent requests never
-        overwrite each other.  If the ring is full, the request is enqueued
-        to the CPU-side waiting deque instead.
+        The submitting thread does not touch the request ring: it clones the
+        prompt tokens (the caller may reuse its tensor) and appends them to the
+        admission deque.  The next owner tick copies them into the slot's inbox
+        and publishes the ring entry, so admission is delayed by at most one
+        tick.
+
+        Raises if the owner thread has died, so a dead owner fails submissions
+        loudly rather than accepting requests nothing will ever publish.
 
         Parameters
         ----------
         rid          : unique request identifier (never repeats)
         token_ids    : 1-D int64 tensor of token IDs (CPU or CUDA)
         initial_step : starting decode step (0 unless prefix-cache is used)
-
-        Returns
-        -------
-        True if the request was written to the ring, False if enqueued to
-        the CPU waiting deque.
         """
         self._raise_drain_error()
+        with self._admission_lock:
+            self._admission.append((rid, token_ids.clone(), initial_step))
 
-        # Keep the producer lock until ready=1 is published. Otherwise a
-        # flusher can reserve a later slot and leave a permanent hole in the
-        # ordered request ring.
-        with self._ring_lock:
-            slot = self._cpu_req_tail & self._mask
-            if self._load_i32_acquire(self._req_ready, slot) != 0:
-                # Ring full — enqueue to CPU-side waiting.
-                with self._waiting_lock:
-                    self._waiting.append((rid, token_ids.clone(), initial_step))
-                return False
-            self._publish_request_locked(slot, rid, token_ids, initial_step)
-            self._cpu_req_tail += 1
-        return True
+    def _publish_admissions(self) -> int:
+        """Publish queued requests while the ring has free slots.
 
-    def flush_waiting(self) -> int:
-        """Move one waiting request from the CPU deque into the ring, if possible.
-
-        Returns the number of requests flushed (0 or 1).
-        Called from :meth:`drain_completions` so waiting requests are
-        gradually fed into the ring as slots free up.
+        Owner-serial: the caller holds ``_owner_lock``, which makes this the
+        request ring's single producer, so a slot can never be claimed twice
+        and the ring can never grow a hole.  (The GPU stops draining at the
+        first ``ready == 0`` slot, so a hole would block everything behind it
+        forever.)  Returns the number of requests published.
         """
-        with self._ring_lock:
+        published = 0
+        while True:
             slot = self._cpu_req_tail & self._mask
             if self._load_i32_acquire(self._req_ready, slot) != 0:
-                return 0  # ring still full
-            with self._waiting_lock:
-                if not self._waiting:
-                    return 0
-                request = self._waiting.popleft()
-
-            rid, token_ids, initial_step = request
+                break  # ring full: the GPU has not drained this slot yet
+            with self._admission_lock:
+                if not self._admission:
+                    break
+                rid, token_ids, initial_step = self._admission.popleft()
             try:
                 self._publish_request_locked(slot, rid, token_ids, initial_step)
-            except Exception:
-                with self._waiting_lock:
-                    self._waiting.appendleft(request)
-                raise
+            except Exception as exc:
+                # A request the CPU cannot stage (an over-long prompt, say)
+                # must not take the owner thread down with it: record the
+                # failure against its rid so its waiter raises, and carry on
+                # with the rest of the queue.  The slot is untouched.
+                self._fail_request(rid, exc)
+                continue
             self._cpu_req_tail += 1
-        return 1
+            published += 1
+        return published
+
+    def _fail_request(self, rid: int, exc: Exception) -> None:
+        """Record that *rid* could never be published; its waiter will raise."""
+        logger.exception("failed to publish rid=%s", rid)
+        with self._lock:
+            self._failed[rid] = exc
 
     def _publish_request_locked(
         self,
@@ -196,7 +211,7 @@ class OnlinePinnedRuntime:
         token_ids: torch.Tensor,
         initial_step: int,
     ) -> None:
-        """Copy and publish one request while ``_ring_lock`` is held."""
+        """Copy and publish one request from the owner tick."""
         prompt_len = token_ids.shape[0]
         with torch.cuda.stream(self._write_stream):
             self._inbox_tokens[slot, :prompt_len].copy_(
@@ -210,12 +225,33 @@ class OnlinePinnedRuntime:
         self._store_i32_release(self._req_ready, slot, 1)
 
     def drain_completions(self) -> List[Tuple[int, int, int]]:
-        """Non-blocking poll: collect all newly completed requests.
+        """Run one owner tick out of band and report the newly completed requests.
+
+        The owner thread ticks on its own; this is the entry point for a driver
+        polling the runtime without one (see the module docstring).  It takes
+        ``_owner_lock``, so such a caller is strictly serialised with the owner
+        thread rather than racing it for ring slots.
 
         Returns a list of ``(rid, buffer_row, final_step)`` tuples for
-        requests that have finished since the last call.
+        requests that have finished since the last tick.
         """
         self._raise_drain_error()
+        with self._owner_lock:
+            return self._owner_tick()
+
+    def _owner_tick(self) -> List[Tuple[int, int, int]]:
+        """One pass of the owner thread: reap completions, then publish.
+
+        The caller holds ``_owner_lock``.  Completions come first so the pages
+        and ring slots they free are available to the requests published in the
+        same tick.
+        """
+        finished = self._reap_completions()
+        self._publish_admissions()
+        return finished
+
+    def _reap_completions(self) -> List[Tuple[int, int, int]]:
+        """Collect every completion the GPU has published since the last tick."""
         finished = []
         while True:
             with self._lock:
@@ -241,10 +277,6 @@ class OnlinePinnedRuntime:
                 self._store_i32_release(self._comp_ready, slot, 0)
                 self._cpu_comp_head += 1
             finished.append((rid, buffer_row, final_step))
-
-        # Flush all waiting requests while ring slots are free.
-        while self.flush_waiting():
-            pass
         return finished
 
     def _check_exported_pages(self, slot: int, rid: int, final_step: int) -> List[int]:
@@ -296,12 +328,12 @@ class OnlinePinnedRuntime:
     def _return_pages_locked(self, pages: List[int]) -> None:
         """Hand *pages* back to the GPU through the page-return ring.
 
-        The completion-drain critical section is the ring's single producer --
-        this is the only writer, and ``_lock`` serialises the drain thread with
-        any caller that polls :meth:`drain_completions` itself -- so the tail is
-        advanced by one writer at a time.  The ids are written first and the
-        tail is release-stored last, pairing with the GPU's acquire load in
-        Step 0.
+        The owner tick is the ring's single producer -- this is the only
+        writer, and ``_owner_lock`` keeps an out-of-band
+        :meth:`drain_completions` caller exclusive with the owner thread -- so
+        the tail is advanced by one writer at a time.  The ids are written
+        first and the tail is release-stored last, pairing with the GPU's
+        acquire load in Step 0.
 
         No occupancy check is needed: a page is in the ring only between its
         export and the GPU's drain, so the ring holds at most ``max_num_pages``
@@ -345,17 +377,23 @@ class OnlinePinnedRuntime:
         head = self._load_i32_acquire(self._page_return_head_mirror, 0)
         return self._cpu_return_tail - head
 
-    def _drain_loop(self) -> None:
-        """Drain completions and flush queued requests in the background."""
-        while not self._drain_stop.is_set():
+    def _owner_loop(self) -> None:
+        """Own both rings: reap completions and publish admissions, forever."""
+        while not self._owner_stop.is_set():
             try:
-                self.drain_completions()
+                with self._owner_lock:
+                    self._owner_tick()
             except Exception as exc:
                 with self._lock:
                     self._drain_error = exc
-                self._drain_stop.set()
+                self._owner_stop.set()
                 break
-            self._drain_stop.wait(0.0002)
+            self._owner_stop.wait(0.0002)
+
+    def _owner_running(self) -> bool:
+        """True while the background owner thread is ticking."""
+        thread = self._owner_thread
+        return thread is not None and thread.is_alive()
 
     def wait_for_request(
         self,
@@ -370,8 +408,12 @@ class OnlinePinnedRuntime:
         """
         deadline = time.monotonic() + timeout
         while True:
-            self.drain_completions()
+            if not self._owner_running():
+                # No owner thread: this caller drives the ticks itself.
+                self.drain_completions()
             with self._lock:
+                self._raise_drain_error_locked()
+                self._raise_request_error_locked(rid)
                 if rid in self._completions:
                     return self._completions[rid]
             if time.monotonic() > deadline:
@@ -405,6 +447,7 @@ class OnlinePinnedRuntime:
         """Return the completion for *rid*, if the GPU has published it."""
         with self._lock:
             self._raise_drain_error_locked()
+            self._raise_request_error_locked(rid)
             return self._completions.get(rid)
 
     def release_request(self, rid: int) -> bool:
@@ -455,45 +498,45 @@ class OnlinePinnedRuntime:
 
     @property
     def waiting_count(self) -> int:
-        """Number of requests queued on the CPU side."""
-        with self._waiting_lock:
-            return len(self._waiting)
+        """Number of submitted requests the owner has not published yet."""
+        with self._admission_lock:
+            return len(self._admission)
 
     def request_shutdown(self) -> None:
         """Signal the GPU persistent kernel to terminate when it is idle."""
         self._store_i32_release(self._shutdown, 0, 1)
 
     def stop(self) -> None:
-        """Stop the completion drainer after the GPU kernel has exited."""
-        self._drain_stop.set()
-        if self._drain_thread is not None:
-            self._drain_thread.join()
+        """Stop the owner thread after the GPU kernel has exited."""
+        self._owner_stop.set()
+        if self._owner_thread is not None:
+            self._owner_thread.join()
 
     def shutdown(self) -> None:
-        """Signal the GPU kernel and stop the completion drainer."""
+        """Signal the GPU kernel and stop the owner thread."""
         self.request_shutdown()
         self.stop()
 
     def start(self) -> None:
-        """Start the background completion drainer after shared state is reset."""
-        if self._drain_thread is not None and self._drain_thread.is_alive():
+        """Start the background owner thread after shared state is reset."""
+        if self._owner_running():
             return
         self._raise_drain_error()
-        self._drain_stop.clear()
-        self._drain_thread = threading.Thread(
-            target=self._drain_loop, daemon=True)
-        self._drain_thread.start()
+        self._owner_stop.clear()
+        self._owner_thread = threading.Thread(
+            target=self._owner_loop, daemon=True)
+        self._owner_thread.start()
 
     def reset(self) -> None:
         """Clear completion bookkeeping and ring state for a new session."""
-        if self._drain_thread is not None and self._drain_thread.is_alive():
+        if self._owner_running():
             raise RuntimeError("cannot reset a running online runtime")
 
-        with self._ring_lock:
+        with self._owner_lock:
             self._cpu_req_tail = 0
             self._cpu_req_ack = 0
-            with self._waiting_lock:
-                self._waiting.clear()
+            with self._admission_lock:
+                self._admission.clear()
             self._req_ready.zero_()
             self._req_request_id.zero_()
             self._req_num_prefix_pages.zero_()
@@ -503,6 +546,7 @@ class OnlinePinnedRuntime:
             self._cpu_comp_head = 0
             self._completions.clear()
             self._abandoned.clear()
+            self._failed.clear()
             self._drain_error = None
             self._comp_ready.zero_()
             self._comp_num_pages.zero_()
@@ -540,3 +584,9 @@ class OnlinePinnedRuntime:
     def _raise_drain_error_locked(self) -> None:
         if self._drain_error is not None:
             raise RuntimeError("completion drainer failed") from self._drain_error
+
+    def _raise_request_error_locked(self, rid: int) -> None:
+        """Surface a publish failure to the thread waiting on that request."""
+        error = self._failed.get(rid)
+        if error is not None:
+            raise RuntimeError(f"rid={rid} was never published") from error

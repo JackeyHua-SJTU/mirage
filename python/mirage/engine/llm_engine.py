@@ -156,8 +156,8 @@ class LLMEngine:
 
     The kernel runs in a background thread so the engine can accept requests
     concurrently.  Each call to :meth:`submit` allocates a unique, never-
-    repeating *request id* (rid), stages tokens in the pinned inbox, writes a
-    ring-buffer entry, and then blocks until the GPU reports completion for
+    repeating *request id* (rid), queues the prompt for the runtime's owner
+    thread to publish, and then blocks until the GPU reports completion for
     that specific rid.  The GPU manages its own buffer-row pool and a
     waiting/running queue pair, so the CPU does not need to reason about
     slot availability.
@@ -203,7 +203,7 @@ class LLMEngine:
         """Submit a single prompt for generation.
 
         Safe to call concurrently — each invocation gets a unique rid and
-        serialises the ring-buffer write under an internal lock.
+        queues it for admission under an internal lock.
 
         Args:
             prompt:        String prompt.
