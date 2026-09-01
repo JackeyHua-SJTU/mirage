@@ -247,6 +247,7 @@ v1 收缩（评审结论）：**只缓存 prompt token 覆盖的完整页**。�
 
 **v2.1 修订（2026-09-01，由协议仿真器 [tests/serving_python/oipl_protocol_sim.py](../../tests/serving_python/oipl_protocol_sim.py) 以最小化 trace 逼出，逐条有失败测试背书）：**
 
+- **(0) 发布一致性（P1 翻转阶段确认的硬规则）**：CPU 发布 npp>0 时**必须同时写 `initial_step = npp·PAGE_SIZE`**——kernel 仍从独立的 `pinned_req_initial_step` 通道读取起始位置，两者不一致 = Step 4 跳过 prefill 却没有导入对应页 = attention 读垃圾（§1.3 记录过的既有 hook 陷阱）。P2 落地时在发布点统一派生，长期应让 kernel 侧改为自行派生并退役该字段。
 - **(a) 发布时 pin 预算（修活性死锁）**：已发布未准入的请求持有 refcount 却排在 FIFO ring 里，可以把足量缓存页钉死到"ring 头部请求永远凑不齐 worst_need"——账本保证安全但不保证活性（`test_unbounded_publish_pins_deadlock_admission` 复现）。规则：管家维护 `Σ(未准入已发布请求的 npp，不含 ring 头) ≤ TOTAL − ceil(MAX_SEQ/PS)`，超出则对新发布**削减 npp**（可降到 0，宁可少命中不可钉死池子）。CPU 无需新通道即可观测准入：GPU 按 FIFO drain，最老已发布槽的 `ready` 1→0 即是准入信号。
 - **(b) 命中校验必须含父链**：仅逐块比对本块 id **不**等价于全前缀比对——链式哈希在深度 j 命中的块可能来自 id 相同、但**前文不同**的另一条链（需要 j−1 层碰撞才会发生，但规则本身必须排除它，否则是静默错误命中而非 miss，S6 失效）。每块存父块引用，命中时沿链校验。仿真器用故意易碰撞的哈希演示了该场景（`scenario_wrong_prefix_hit`）。
 - **(c) 水位线在紧池下不是纯启发式**：缓存驻留页 1:1 压低 `avail_uncommitted`，若管家不对"最老已发布请求久等未准入"做反应，准入会在无任何不变量被破坏的情况下无限停摆（GPU 没有"我饿了"的通道）。规则：最老已发布请求连续 N 个管家周期未准入 → 每周期额外驱逐一个可驱逐块。P3 验收因此是**双边的**：准入门触发频率 ≈ 0，**且**无发布请求等待超过 X 周期。
@@ -261,7 +262,7 @@ v1 收缩（评审结论）：**只缓存 prompt token 覆盖的完整页**。�
 - **S2 无写共享**：`initial_step = npp·PS` 页对齐 → 导入者首写落在页槽 npp（新页）；只缓存完整冻结页规避同迭代兄弟任务无序问题。同一缓存页出现在同批两请求页表里是纯读共享：Step 2 快照、Step 1 双导出、CPU 双 refcount−− 均自洽。
 - **S3 守恒**：`avail_uncommitted = (page_queue_tail − page_queue_head) − Σ reserved_remaining[row]` 是单线程私有量的恒等式。请求页数上界：done 条件（[:503-506](../../include/mirage/persistent_kernel/persistent_kernel.cuh#L503-L506)）使最大写入位置 ≤ MAX_SEQ−1 → 页数 ≤ ceil(MAX_SEQ/PS) = npp + worst_need → `reserved_remaining ≥ 0` 恒成立。
 - **S4 无溢出**：完成 ring 占用 ≤ total_inflight（#754 row-lease：完成未 ack 的请求各占一 row）≤ cap——把 `cap ≥ total_inflight` 加进 [`_validate_kernel_compatibility`](../../python/mirage/mpk/persistent_kernel.py#L477-L527)（顺带补上 ring capacity 本就缺失的校验）；归还 ring 容量 ≥ 总页数。
-- **S5 退化（诚实版）**：所有者线程死亡 → 页停止归还、准入门逐渐拒绝新请求；**在 #754 的 comp 自旋语义下，drain 死透且完成数超过 ring 余量时 GPU 会 wedge**——这是 #754 引入的既有暴露面，OIPL 扩大其后果。缓解 = drainer 加固（log-and-continue + 看门狗），属 #754 加固范畴，非本设计内部可解。
+- **S5 退化（P1 故障注入实测后的第三版）**：drain 线程死亡的实际行为是**即时 fail-closed**而非静默停摆——预存的 `_raise_drain_error` 闩锁使后续每个调用者（含 submit）立刻抛错，所有请求 ~0ms 内得到 500；comp-spin 来不及触发（submit 在触碰 ring 前已抛错）。台账**冻结而非损坏**：free 恰好少掉故障前已准入请求持有的页数，pending==0、head==returned、零异常。剩余暴露面 = 可用性（fail-stop），非正确性；看门狗/自愈是后续加固项而非安全前提。请求线程侧的一次性 drain 异常只损失该请求本身（单个 500），守恒不受影响。
 - **S6 键正确性**：逐匹配块全量 id 比对**加父链校验**（v2.1-b；只比本块 id 不排除跨链同 id 块）→ 错误命中不可能；最坏情形 = 零收益。模板不稳定只降命中率不伤正确性。
 
 **与 #666 两案对比**：每步关键路径开销 ≈0（vs Option 1 的单线程指针追逐）；一致性构造性消解（vs Option 2 未解决）；策略在 Python 迭代（vs Option 1 重编译）；代价是页回收 +1 次 CPU 往返（≤0.2ms + ≤1 迭代，由 GPU 台账兜底不构成正确性风险）与 v1 并发同前缀突发 miss（v2 用 `pinned_step ≥ (j+1)·PS` 谓词做在飞发布——该谓词已与 KV 写 release 排序）。
@@ -313,7 +314,7 @@ v1 收缩（评审结论）：**只缓存 prompt token 覆盖的完整页**。�
 
 ## 11. 遗留不确定项
 
-1. **Qwen3 模板前缀稳定性**（`<think>` 剥离是否破坏 `[sys,u1]` ⊑ `[sys,u1,a1,u2]` 的 token 前缀关系）——模板未 vendored，repo 内不可判定；P2 单测定论。不稳定 → 命中率打折，正确性不受影响（S6）。
+1. ~~Qwen3 模板前缀稳定性~~ **已实测解决（2026-09-01，真实 tokenizer 实验）**：`enable_thinking=True`（默认）下跨轮 token 前缀**完全稳定**——历史 assistant 内容含 `<think>` 也稳定（模板每次渲染都同样剥除）。仅硬开关 `enable_thinking=False` 破坏前缀，且只差 generation-prompt 尾部强插的 4 个 token（`<think>\n\n</think>`）。P2 规则：**插入时把 gen-prompt 尾巴排除在可缓存区外**（尾长启动时渲染一次即得）。`/no_think` 软开关不影响结构。残余：实验用 transformers 5.16.1，仓库钉 4.57.1——P2 带 in-repo 单测复确认。
 2. **PS=64 下 Step 2 快照与 Step 0 drain 的单线程开销**——预估 µs 级（批内 ≤256 页），需 `MPK_ENABLE_PROFILING` 实测；超标则把快照挪 global（可复用死掉的 `paged_kv_indices_snapshot`）。
 3. **"链式单叶图"前提的持久性**——spec-decode/MoE 图可能多叶；已列构建期断言，多叶时 OIPL 须禁用或改逐任务计数。
 4. **#754 尚未合并且 CI 未绿**——本文对其依赖基于 patch 文本而非运行验证。
