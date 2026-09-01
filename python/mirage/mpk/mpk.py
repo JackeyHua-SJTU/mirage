@@ -68,6 +68,15 @@ class MPKMetadata:
     pinned_step: Optional[torch.Tensor] = None
     pinned_inbox_tokens: Optional[torch.Tensor] = None
     pinned_rid_at_row: Optional[torch.Tensor] = None
+    # OIPL page-lifecycle channels (MODE_ONLINE_PINNED only)
+    pinned_comp_num_pages: Optional[torch.Tensor] = None
+    pinned_comp_pages: Optional[torch.Tensor] = None
+    pinned_req_num_prefix_pages: Optional[torch.Tensor] = None
+    pinned_req_prefix_pages: Optional[torch.Tensor] = None
+    pinned_page_return_ring: Optional[torch.Tensor] = None
+    pinned_page_return_tail: Optional[torch.Tensor] = None
+    pinned_page_return_head_mirror: Optional[torch.Tensor] = None
+    pinned_page_free_count_mirror: Optional[torch.Tensor] = None
     # spec decode config
     spec_decode: Optional[str] = None
     spec_decode_config: Optional[object] = None
@@ -211,6 +220,14 @@ class MPK:
         self.pinned_step             = args.pinned_step
         self.pinned_inbox_tokens     = args.pinned_inbox_tokens
         self.pinned_rid_at_row       = args.pinned_rid_at_row
+        self.pinned_comp_num_pages          = args.pinned_comp_num_pages
+        self.pinned_comp_pages              = args.pinned_comp_pages
+        self.pinned_req_num_prefix_pages    = args.pinned_req_num_prefix_pages
+        self.pinned_req_prefix_pages        = args.pinned_req_prefix_pages
+        self.pinned_page_return_ring        = args.pinned_page_return_ring
+        self.pinned_page_return_tail        = args.pinned_page_return_tail
+        self.pinned_page_return_head_mirror = args.pinned_page_return_head_mirror
+        self.pinned_page_free_count_mirror  = args.pinned_page_free_count_mirror
 
         self.profiler_tensor = args.profiler_tensor
         self.spec_decode_config = args.spec_decode_config
@@ -253,6 +270,14 @@ class MPK:
             "pinned_step":             args.pinned_step,
             "pinned_inbox_tokens":     args.pinned_inbox_tokens,
             "pinned_rid_at_row":       args.pinned_rid_at_row,
+            "pinned_comp_num_pages":          args.pinned_comp_num_pages,
+            "pinned_comp_pages":              args.pinned_comp_pages,
+            "pinned_req_num_prefix_pages":    args.pinned_req_num_prefix_pages,
+            "pinned_req_prefix_pages":        args.pinned_req_prefix_pages,
+            "pinned_page_return_ring":        args.pinned_page_return_ring,
+            "pinned_page_return_tail":        args.pinned_page_return_tail,
+            "pinned_page_return_head_mirror": args.pinned_page_return_head_mirror,
+            "pinned_page_free_count_mirror":  args.pinned_page_free_count_mirror,
         }
         self.persistent_kernel = PersistentKernel(
             mode=args.mode,

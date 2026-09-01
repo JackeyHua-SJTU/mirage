@@ -9,6 +9,11 @@ The kernel uses two lock-free power-of-2 ring buffers backed by pinned
   Completion ring (GPU→CPU): GPU writes {rid, buffer_row, final_step} then
                               sets ready=1; CPU polls, collects, clears to 0.
 
+Both rings carry the OIPL page-lifecycle payload: a completion also reports the
+request's final KV page list, and a request also carries the prefix pages the
+CPU wants imported.  The GPU is still the sole page releaser, so the CPU only
+reconciles what it is handed (see :meth:`_check_exported_pages`).
+
 Each ring slot has its own independent pinned inbox buffer, so concurrent
 submits can write prompt tokens without overwriting each other.  The GPU
 copies inbox tokens to the assigned buffer row when admitting a request.
@@ -26,11 +31,16 @@ Usage::
 """
 
 import collections
+import logging
 import threading
 import time
 from typing import Deque, Dict, List, Tuple
 
 import torch
+
+from .persistent_kernel import max_pages_per_request
+
+logger = logging.getLogger(__name__)
 
 
 class OnlinePinnedRuntime:
@@ -58,6 +68,27 @@ class OnlinePinnedRuntime:
         self._pinned_step       = mpk.pinned_step             # int32[max_batched], pinned
         self._inbox_tokens      = mpk.pinned_inbox_tokens     # int64[cap, max_seq_len], pinned
         self._pinned_rid_at_row = mpk.pinned_rid_at_row       # int32[max_batched], pinned
+
+        # OIPL page-lifecycle channels.  The GPU is still the only page
+        # releaser: it exports every completed request's page list here and
+        # frees the pages itself, so the CPU only reconciles the export.  The
+        # import and return channels are wired end to end but stay inert --
+        # num_prefix_pages is always 0 and nothing is ever returned.
+        self._comp_num_pages       = mpk.pinned_comp_num_pages
+        self._comp_pages           = mpk.pinned_comp_pages
+        self._req_num_prefix_pages = mpk.pinned_req_num_prefix_pages
+        self._req_prefix_pages     = mpk.pinned_req_prefix_pages
+        self._page_return_ring     = mpk.pinned_page_return_ring
+        self._page_return_tail     = mpk.pinned_page_return_tail
+        self._page_return_head_mirror = mpk.pinned_page_return_head_mirror
+        self._page_free_count_mirror  = mpk.pinned_page_free_count_mirror
+
+        self._page_size = mpk.metadata.page_size
+        self._max_num_pages = mpk.max_num_pages
+        self._pages_per_req = max_pages_per_request(
+            mpk.max_seq_length, self._page_size)
+        # Shadow-validation counters, read by tests through `page_stats`.
+        self._page_stats: Dict[str, int] = collections.Counter()
 
         # CPU-private ring cursors.
         self._cpu_req_tail  = 0  # next ring slot to write
@@ -168,6 +199,8 @@ class OnlinePinnedRuntime:
         self._req_request_id[slot] = rid
         self._req_prompt_len[slot] = prompt_len
         self._req_initial_step[slot] = initial_step
+        # No prefix import: the GPU allocates the whole page table itself.
+        self._req_num_prefix_pages[slot] = 0
         self._store_i32_release(self._req_ready, slot, 1)
 
     def drain_completions(self) -> List[Tuple[int, int, int]]:
@@ -186,6 +219,10 @@ class OnlinePinnedRuntime:
                 rid         = int(self._comp_request_id[slot].item())
                 buffer_row  = int(self._comp_buffer_row[slot].item())
                 final_step  = int(self._comp_final_step[slot].item())
+                # Page accounting is unconditional: it runs for abandoned
+                # completions too, exactly as it will once the CPU owns the
+                # pages.
+                self._check_exported_pages(slot, rid, final_step)
                 if rid in self._abandoned:
                     self._release_row_locked(rid, buffer_row)
                     self._abandoned.remove(rid)
@@ -201,6 +238,67 @@ class OnlinePinnedRuntime:
         while self.flush_waiting():
             pass
         return finished
+
+    def _check_exported_pages(self, slot: int, rid: int, final_step: int) -> List[int]:
+        """Reconcile one completion's exported KV page list.
+
+        The GPU exports the page table it built for the request's last
+        iteration, so its length is fixed by the same arithmetic Step 1 used to
+        report ``final_step``: the batch consumed positions up to ``final_step``
+        exclusive of the freshly generated token, giving a KV length of
+        ``final_step`` and ``ceil(final_step / page_size)`` pages.  Anything
+        else means the export and the page table have drifted apart, which is
+        exactly the failure the CPU could not see before this channel existed.
+
+        Returns the exported page ids and records any disagreement in
+        :attr:`page_stats`; it never raises, so a mismatch cannot wedge the
+        drain thread.
+        """
+        num_pages = int(self._comp_num_pages[slot].item())
+        expected = (final_step + self._page_size - 1) // self._page_size
+        stats = self._page_stats
+        stats["completions"] += 1
+
+        if not 0 <= num_pages <= self._pages_per_req:
+            stats["bad_page_count"] += 1
+            self._log_page_anomaly(
+                f"rid={rid} exported num_pages={num_pages} outside "
+                f"[0, {self._pages_per_req}]")
+            return []
+
+        base = slot * self._pages_per_req
+        pages = self._comp_pages[base:base + num_pages].tolist()
+        stats["exported_pages"] += num_pages
+
+        if num_pages != expected:
+            stats["count_mismatch"] += 1
+            self._log_page_anomaly(
+                f"rid={rid} exported {num_pages} pages, final_step="
+                f"{final_step} implies {expected}")
+        if any(not 0 <= page < self._max_num_pages for page in pages):
+            stats["page_id_out_of_range"] += 1
+            self._log_page_anomaly(f"rid={rid} exported page ids {pages}")
+        if len(set(pages)) != num_pages:
+            stats["duplicate_page"] += 1
+            self._log_page_anomaly(f"rid={rid} exported repeated pages {pages}")
+        return pages
+
+    def _log_page_anomaly(self, message: str) -> None:
+        """Log the first page-export anomaly only; the rest are counted."""
+        if self._page_stats["anomalies"] == 0:
+            logger.warning("page export mismatch: %s", message)
+        self._page_stats["anomalies"] += 1
+
+    @property
+    def page_stats(self) -> Dict[str, int]:
+        """Snapshot of the page-export reconciliation counters."""
+        with self._lock:
+            return dict(self._page_stats)
+
+    @property
+    def gpu_free_page_count(self) -> int:
+        """Free pages the GPU published at the end of its last iteration."""
+        return self._load_i32_acquire(self._page_free_count_mirror, 0)
 
     def _drain_loop(self) -> None:
         """Drain completions and flush queued requests in the background."""
@@ -353,6 +451,8 @@ class OnlinePinnedRuntime:
                 self._waiting.clear()
             self._req_ready.zero_()
             self._req_request_id.zero_()
+            self._req_num_prefix_pages.zero_()
+            self._req_prefix_pages.zero_()
 
         with self._lock:
             self._cpu_comp_head = 0
@@ -360,10 +460,19 @@ class OnlinePinnedRuntime:
             self._abandoned.clear()
             self._drain_error = None
             self._comp_ready.zero_()
+            self._comp_num_pages.zero_()
+            self._comp_pages.zero_()
+            self._page_stats.clear()
 
         self._shutdown.zero_()
         self._pinned_step.zero_()
         self._pinned_rid_at_row.fill_(-1)
+        # The GPU re-initializes its private return-ring head to 0 in
+        # init_kernel, so the CPU-side cursors and mirrors start there too.
+        self._page_return_ring.zero_()
+        self._page_return_tail.zero_()
+        self._page_return_head_mirror.zero_()
+        self._page_free_count_mirror.zero_()
 
     def _load_i32_acquire(self, tensor: torch.Tensor, index: int) -> int:
         return int(self._mpk.persistent_kernel.load_i32_acquire(

@@ -12,6 +12,10 @@ import torch.distributed as dist
 from ..mpk.mpk import MPK, MPKMetadata
 from ..mpk import OnlinePinnedRuntime
 from ..mpk.models.graph_builder import MirageModelConfig
+from ..mpk.persistent_kernel import (
+    max_pages_per_request,
+    page_return_ring_capacity,
+)
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -155,6 +159,10 @@ class ModelRunner:
         n_req = config.max_num_batched_requests
         n_tok = config.max_num_batched_tokens
         cap = config.pinned_ring_capacity
+        # Must match the -D macros the kernel is compiled with.
+        pages_per_req = max_pages_per_request(
+            config.max_seq_length, config.page_size)
+        return_ring_cap = page_return_ring_capacity(config.max_num_pages)
 
         return dict(
             step=torch.zeros(n_req, dtype=torch.int32, device="cuda"),
@@ -182,4 +190,15 @@ class ModelRunner:
             pinned_step=torch.zeros(n_req, dtype=torch.int32).pin_memory(),
             pinned_inbox_tokens=torch.zeros(cap, config.max_seq_length, dtype=torch.int64).pin_memory(),
             pinned_rid_at_row=torch.full((n_req,), -1, dtype=torch.int32).pin_memory(),
+            # OIPL page-lifecycle channels: page export (GPU→CPU) on the
+            # completion ring, prefix import (CPU→GPU) on the request ring,
+            # and the SPSC page-return ring with its two GPU-published mirrors.
+            pinned_comp_num_pages=torch.zeros(cap, dtype=torch.int32).pin_memory(),
+            pinned_comp_pages=torch.zeros(cap * pages_per_req, dtype=torch.int32).pin_memory(),
+            pinned_req_num_prefix_pages=torch.zeros(cap, dtype=torch.int32).pin_memory(),
+            pinned_req_prefix_pages=torch.zeros(cap * pages_per_req, dtype=torch.int32).pin_memory(),
+            pinned_page_return_ring=torch.zeros(return_ring_cap, dtype=torch.int32).pin_memory(),
+            pinned_page_return_tail=torch.zeros(1, dtype=torch.int32).pin_memory(),
+            pinned_page_return_head_mirror=torch.zeros(1, dtype=torch.int32).pin_memory(),
+            pinned_page_free_count_mirror=torch.zeros(1, dtype=torch.int32).pin_memory(),
         )

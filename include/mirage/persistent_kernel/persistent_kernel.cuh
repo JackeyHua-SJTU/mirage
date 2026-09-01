@@ -181,6 +181,14 @@ __global__ void init_kernel(RuntimeConfig config) {
     for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
       config.free_rows[(*config.free_row_top)++] = i;
     }
+    // OIPL page ledger and the private head of the page return ring. The
+    // ledger identity avail_uncommitted == (page_queue_tail - page_queue_head)
+    // - sum(reserved_remaining) holds from here on.
+    *config.gpu_return_head = 0;
+    *config.avail_uncommitted = MPK_MAX_NUM_PAGES;
+    for (int i = 0; i < MPK_MAX_NUM_BATCHED_REQUESTS; i++) {
+      config.reserved_remaining[i] = 0;
+    }
 #endif
 #endif
   }
@@ -474,6 +482,7 @@ __device__ __forceinline__ bool
   int gpu_req_head = *config.gpu_req_head;
   int gpu_comp_tail = *config.gpu_comp_tail;
   int free_row_top = *config.free_row_top;
+  int avail_uncommitted = *config.avail_uncommitted;
   int const ring_mask = MPK_PINNED_RING_CAPACITY - 1;
 
   // Reclaim rows only after the CPU has copied their completed output and
@@ -526,6 +535,12 @@ __device__ __forceinline__ bool
     if (done) {
       int rid = config.request_rids[i];
 
+      // The page table still carries the previous iteration's layout here, so
+      // paged_kv_indices_buffer[kv_indptr..] is the request's final KV page
+      // list — the same source the free loop below iterates.
+      int kv_indptr = config.paged_kv_indptr_buffer[i];
+      int num_pages = config.paged_kv_indptr_buffer[i + 1] - kv_indptr;
+
       // Write completion entry so CPU background thread can collect the
       // output. Reports the original rid (not the buffer row).
       int comp_slot = gpu_comp_tail & ring_mask;
@@ -535,6 +550,14 @@ __device__ __forceinline__ bool
       config.pinned_comp_request_id[comp_slot] = (int32_t)rid;
       config.pinned_comp_buffer_row[comp_slot] = (int32_t)row;
       config.pinned_comp_final_step[comp_slot] = (int32_t)(step + num_tokens);
+      // Export the page list before releasing the slot, so a CPU that observes
+      // ready==1 also observes the whole payload.
+      config.pinned_comp_num_pages[comp_slot] = (int32_t)num_pages;
+      int comp_page_base = comp_slot * MPK_MAX_PAGES_PER_REQ;
+      for (int j = 0; j < num_pages; j++) {
+        config.pinned_comp_pages[comp_page_base + j] =
+            (int32_t)config.paged_kv_indices_buffer[kv_indptr + j];
+      }
       st_release_sys_i32(&config.pinned_comp_ready[comp_slot], 1);
       gpu_comp_tail++;
 
@@ -544,13 +567,18 @@ __device__ __forceinline__ bool
       config.request_ids[i] = -1;
       config.request_rids[i] = -1;
 
-      // Free pages back to the page queue.
-      int kv_indptr = config.paged_kv_indptr_buffer[i];
-      int num_pages = config.paged_kv_indptr_buffer[i + 1] - kv_indptr;
+      // Refund the page budget this row reserved but never spent.
+      avail_uncommitted += config.reserved_remaining[row];
+      config.reserved_remaining[row] = 0;
+
+      // Free pages back to the page queue. Export and free coexist while the
+      // CPU only validates the export; the CPU becomes the sole releaser when
+      // this loop is replaced by the page-return ring.
       for (int j = 0; j < num_pages; j++) {
         config.page_queue[page_queue_tail % MPK_MAX_NUM_PAGES] =
             config.paged_kv_indices_buffer[kv_indptr + j];
         page_queue_tail++;
+        avail_uncommitted++;
       }
     }
   }
@@ -606,6 +634,10 @@ __device__ __forceinline__ bool
       config.paged_kv_indices_buffer[num_pages + j] =
           config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
       page_queue_head++;
+      // Spending a reserved page moves it from "promised" to "held": the free
+      // count and the reservation drop together, so avail_uncommitted is
+      // unchanged.
+      config.reserved_remaining[row]--;
     }
 
     num_pages += num_new_pages;
@@ -627,9 +659,20 @@ __device__ __forceinline__ bool
     int32_t new_rid = config.pinned_req_request_id[req_slot];
     int32_t prompt_len = config.pinned_req_prompt_len[req_slot];
     int32_t initial_step = config.pinned_req_initial_step[req_slot];
+    // Prefix-import channel. Read while the slot is still owned by the GPU:
+    // the ring slot is only released at the end of this admit body.
+    int32_t num_prefix_pages = config.pinned_req_num_prefix_pages[req_slot];
+    int prefix_page_base = req_slot * MPK_MAX_PAGES_PER_REQ;
+
+    // Reserve the worst-case page budget this request can still need: a full
+    // page table minus the pages it imports. Every fresh page it later pops
+    // draws down the reservation, so it can never be outbid mid-flight.
+    int worst_need = MPK_MAX_PAGES_PER_REQ - num_prefix_pages;
+    avail_uncommitted -= worst_need;
 
     // Pop a free buffer row and copy inbox tokens from this ring slot.
     int row = config.free_rows[--free_row_top];
+    config.reserved_remaining[row] = worst_need;
     int inbox_base = req_slot * MPK_MAX_SEQ_LENGTH;
     for (int j = 0; j < prompt_len; j++) {
       config.tokens[row * MPK_MAX_SEQ_LENGTH + j] =
@@ -641,10 +684,6 @@ __device__ __forceinline__ bool
     // finds new_rid must not see progress or tokens from the prior lease.
     st_release_sys_i32(&config.pinned_step[row], initial_step);
     st_release_sys_i32(&config.pinned_rid_at_row[row], new_rid);
-
-    // Clear the ring slot so CPU can reuse it.
-    st_release_sys_i32(&config.pinned_req_ready[req_slot], 0);
-    gpu_req_head++;
 
     // Fill batch slot.
     config.request_ids[num_reqs] = (int16_t)row;
@@ -666,11 +705,25 @@ __device__ __forceinline__ bool
     config.paged_kv_last_page_len_buffer[num_reqs] =
         paged_kv_last_page_len(initial_step + num_new_tokens);
 
+    // Two-phase page-table fill: slots below num_prefix_pages are imported
+    // from the CPU's prefix array, the rest are fresh pages off the queue.
     for (int j = 0; j < num_new_pages; j++) {
-      config.paged_kv_indices_buffer[num_pages + j] =
-          config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
-      page_queue_head++;
+      if (j < num_prefix_pages) {
+        config.paged_kv_indices_buffer[num_pages + j] =
+            config.pinned_req_prefix_pages[prefix_page_base + j];
+      } else {
+        config.paged_kv_indices_buffer[num_pages + j] =
+            config.page_queue[page_queue_head % MPK_MAX_NUM_PAGES];
+        page_queue_head++;
+        config.reserved_remaining[row]--;
+      }
     }
+
+    // Release the ring slot only now: the prefix array lives in it and must be
+    // fully consumed before the CPU may reuse the slot. Single consumer, so
+    // there is nothing to gain from clearing earlier.
+    st_release_sys_i32(&config.pinned_req_ready[req_slot], 0);
+    gpu_req_head++;
 
     num_tokens += num_new_tokens;
     num_pages += num_new_pages;
@@ -693,6 +746,12 @@ __device__ __forceinline__ bool
   *config.gpu_req_head = gpu_req_head;
   *config.gpu_comp_tail = gpu_comp_tail;
   *config.free_row_top = free_row_top;
+  *config.avail_uncommitted = avail_uncommitted;
+
+  // Publish the free-page count so the CPU can reconcile what it has been
+  // handed against what the pool actually holds.
+  st_release_sys_i32(&config.pinned_page_free_count_mirror[0],
+                     (int32_t)(page_queue_tail - page_queue_head));
 
   // If the batch is completely empty (no active requests, ring empty),
   // spin-wait instead of exiting so the kernel stays alive for future
@@ -1458,7 +1517,7 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[8]: paged_kv_indices_buffer
 // meta_tensors[9]: paged_kv_last_page_len_buffer
 // meta_tensors[10]: paged_kv_indices_snapshot
-// MODE_ONLINE_PINNED only (indices 11..22):
+// MODE_ONLINE_PINNED only (indices 11..30):
 // meta_tensors[11]: pinned_req_ready
 // meta_tensors[12]: pinned_req_request_id
 // meta_tensors[13]: pinned_req_prompt_len
@@ -1471,6 +1530,14 @@ static std::map<std::string, void *> global_model_tensors;
 // meta_tensors[20]: pinned_step
 // meta_tensors[21]: pinned_inbox_tokens
 // meta_tensors[22]: pinned_rid_at_row
+// meta_tensors[23]: pinned_comp_num_pages
+// meta_tensors[24]: pinned_comp_pages
+// meta_tensors[25]: pinned_req_num_prefix_pages
+// meta_tensors[26]: pinned_req_prefix_pages
+// meta_tensors[27]: pinned_page_return_ring
+// meta_tensors[28]: pinned_page_return_tail
+// meta_tensors[29]: pinned_page_return_head_mirror
+// meta_tensors[30]: pinned_page_free_count_mirror
 
 extern "C" void init_request_resources() {
   init_kernel<<<dim3(1, 1, 1), dim3(INIT_NUM_THREADS, 1, 1)>>>(
@@ -1498,10 +1565,10 @@ extern "C" void
     global_model_tensors[model_tensor_names[i]] = model_tensor_ptrs[i];
   }
   // meta_tensors[0..10] are always required.
-  // meta_tensors[11..22]: pinned ring pointers (MODE_ONLINE_PINNED only,
+  // meta_tensors[11..30]: pinned ring pointers (MODE_ONLINE_PINNED only,
   //   passed as CPU-side void* from Python's pinned tensors)
 #if defined(MODE_ONLINE_PINNED)
-  assert(meta_tensors.size() == 23);
+  assert(meta_tensors.size() == 31);
 #else
   assert(meta_tensors.size() == 11);
 #endif
@@ -1547,6 +1614,22 @@ extern "C" void
       static_cast<int64_t *>(meta_tensors[21]);
   global_runtime_config.pinned_rid_at_row =
       static_cast<int32_t volatile *>(meta_tensors[22]);
+  global_runtime_config.pinned_comp_num_pages =
+      static_cast<int32_t *>(meta_tensors[23]);
+  global_runtime_config.pinned_comp_pages =
+      static_cast<int32_t *>(meta_tensors[24]);
+  global_runtime_config.pinned_req_num_prefix_pages =
+      static_cast<int32_t *>(meta_tensors[25]);
+  global_runtime_config.pinned_req_prefix_pages =
+      static_cast<int32_t *>(meta_tensors[26]);
+  global_runtime_config.pinned_page_return_ring =
+      static_cast<int32_t volatile *>(meta_tensors[27]);
+  global_runtime_config.pinned_page_return_tail =
+      static_cast<int32_t volatile *>(meta_tensors[28]);
+  global_runtime_config.pinned_page_return_head_mirror =
+      static_cast<int32_t volatile *>(meta_tensors[29]);
+  global_runtime_config.pinned_page_free_count_mirror =
+      static_cast<int32_t volatile *>(meta_tensors[30]);
 #endif
   global_runtime_config.num_workers = num_workers;
   global_runtime_config.num_local_schedulers = num_local_schedulers;
@@ -1623,6 +1706,11 @@ extern "C" void
   global_runtime_config.free_rows =
       gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS);
   global_runtime_config.free_row_top = gpu_malloc<int>(sizeof(int));
+  // OIPL page ledger and page-return-ring head; GPU-private like free_rows.
+  global_runtime_config.gpu_return_head = gpu_malloc<int>(sizeof(int));
+  global_runtime_config.avail_uncommitted = gpu_malloc<int>(sizeof(int));
+  global_runtime_config.reserved_remaining =
+      gpu_malloc<int>(sizeof(int) * MPK_MAX_NUM_BATCHED_REQUESTS);
 #endif
 #endif
   // 136-worker B200 runs can temporarily outpace the default queue depth on
@@ -1914,7 +2002,10 @@ extern "C" void finalize_persistent_kernel() {
   gpu_free(global_runtime_config.request_rids);
   gpu_free(global_runtime_config.free_rows);
   gpu_free(global_runtime_config.free_row_top);
-  // pinned ring arrays (meta_tensors[11..22]) are Python-owned; do not free.
+  gpu_free(global_runtime_config.gpu_return_head);
+  gpu_free(global_runtime_config.avail_uncommitted);
+  gpu_free(global_runtime_config.reserved_remaining);
+  // pinned ring arrays (meta_tensors[11..30]) are Python-owned; do not free.
 #endif
 #endif
   int num_workers = global_runtime_config.num_workers;

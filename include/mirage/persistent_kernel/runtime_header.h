@@ -420,6 +420,33 @@ struct RuntimeConfig {
   // memory).  Sized for max_num_batched_requests (no GPU waiting queue).
   int *free_rows;    // [MPK_MAX_NUM_BATCHED_REQUESTS]
   int *free_row_top; // stack pointer
+  // ── OIPL page lifecycle (ownership inversion) ────────────────────────────
+  // Page export (completion ring extension), GPU→CPU. Written before the
+  // st.release.sys on pinned_comp_ready, so a CPU that observes ready==1 also
+  // observes the whole page list.
+  int32_t *pinned_comp_num_pages; // [MPK_PINNED_RING_CAPACITY]
+  int32_t
+      *pinned_comp_pages; // [MPK_PINNED_RING_CAPACITY * MPK_MAX_PAGES_PER_REQ]
+  // Prefix import (request ring extension), CPU→GPU. Consumed before the ring
+  // slot's ready flag is cleared, so the CPU cannot overwrite a live array.
+  int32_t *pinned_req_num_prefix_pages; // [MPK_PINNED_RING_CAPACITY]
+  int32_t *pinned_req_prefix_pages;     // [MPK_PINNED_RING_CAPACITY *
+                                        //  MPK_MAX_PAGES_PER_REQ]
+  // Page return ring (CPU→GPU, SPSC). Capacity is a power of two >=
+  // MPK_MAX_NUM_PAGES, so the pages in existence structurally cannot overflow
+  // it. CPU writes an id then release-stores the tail; the GPU keeps its head
+  // private and republishes it through the mirror for CPU-side accounting.
+  int32_t volatile *pinned_page_return_ring; // [MPK_PAGE_RETURN_RING_CAPACITY]
+  int32_t volatile *pinned_page_return_tail; // [1]
+  int32_t volatile *pinned_page_return_head_mirror; // [1]
+  // Free-page count published every iteration: page_queue_tail -
+  // page_queue_head. Observability plus the ground truth for the CPU-side
+  // page-conservation check.
+  int32_t volatile *pinned_page_free_count_mirror; // [1]
+  // GPU-private OIPL state (gpu_malloc, never touched by CPU).
+  int *gpu_return_head;    // private head of the page return ring
+  int *avail_uncommitted;  // free pages not promised to an admitted request
+  int *reserved_remaining; // [MPK_MAX_NUM_BATCHED_REQUESTS], per buffer row
 #endif
   void *profiler_buffer;
   bool split_worker_scheduler;

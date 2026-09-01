@@ -18,6 +18,30 @@ from .multigpu import (
 )
 from typing import Optional
 
+
+def max_pages_per_request(max_seq_length: int, page_size: int) -> int:
+    """Worst-case page-table length of one request (``MPK_MAX_PAGES_PER_REQ``).
+
+    Sizes the per-slot prefix-import and page-export arrays.  The kernel's
+    completion condition caps the highest written position at
+    ``max_seq_length - 1``, so no request can ever hold more pages than this.
+    """
+    return (max_seq_length + page_size - 1) // page_size
+
+
+def page_return_ring_capacity(max_num_pages: int) -> int:
+    """Capacity of the CPU→GPU page-return ring (``MPK_PAGE_RETURN_RING_CAPACITY``).
+
+    The smallest power of two at least ``max_num_pages``.  The pages in
+    existence never exceed ``max_num_pages``, so the ring structurally cannot
+    overflow and needs no producer-side occupancy check.
+    """
+    capacity = 1
+    while capacity < max_num_pages:
+        capacity *= 2
+    return capacity
+
+
 HARD_CODE = """
 #include <Python.h>
 #include <cstdint>
@@ -296,7 +320,9 @@ def get_compile_command(
         flags = flags + ["-DMODE_MULTI_TURN"]
     elif mpk.mode == "online_pinned":
         flags = flags + ["-DMODE_ONLINE_PINNED",
-                         f"-DMPK_PINNED_RING_CAPACITY={mpk.pinned_ring_capacity}"]
+                         f"-DMPK_PINNED_RING_CAPACITY={mpk.pinned_ring_capacity}",
+                         f"-DMPK_MAX_PAGES_PER_REQ={mpk.max_pages_per_request}",
+                         f"-DMPK_PAGE_RETURN_RING_CAPACITY={mpk.page_return_ring_capacity}"]
     else:
         raise ValueError(f"Invalid persistent kernel mode: {mpk.mode}")
 
@@ -521,6 +547,16 @@ class PersistentKernel:
             "eos_token_id": -1,
         }
 
+    @property
+    def max_pages_per_request(self) -> int:
+        """``MPK_MAX_PAGES_PER_REQ`` — see :func:`max_pages_per_request`."""
+        return max_pages_per_request(self.max_seq_length, self.page_size)
+
+    @property
+    def page_return_ring_capacity(self) -> int:
+        """``MPK_PAGE_RETURN_RING_CAPACITY`` — see :func:`page_return_ring_capacity`."""
+        return page_return_ring_capacity(self.max_num_pages)
+
     def _save_kernel_metadata(self, path: str) -> None:
         """Save kernel config for validation when loading."""
         metadata = {
@@ -530,6 +566,9 @@ class PersistentKernel:
             "max_num_batched_tokens": self.max_num_batched_tokens,
             "max_num_pages": self.max_num_pages,
             "page_size": self.page_size,
+            "pinned_ring_capacity": self.pinned_ring_capacity,
+            "max_pages_per_request": self.max_pages_per_request,
+            "page_return_ring_capacity": self.page_return_ring_capacity,
             "world_size": self.world_size,
             "rank": self.mpi_rank,
             "cuda_cc": self.target_cc,
@@ -551,6 +590,12 @@ class PersistentKernel:
             ("max_num_batched_tokens", self.max_num_batched_tokens),
             ("max_num_pages", self.max_num_pages),
             ("page_size", self.page_size),
+            # Ring and page geometry are compiled in as -D macros, so a saved
+            # kernel whose geometry differs indexes the pinned arrays with the
+            # wrong stride.
+            ("pinned_ring_capacity", self.pinned_ring_capacity),
+            ("max_pages_per_request", self.max_pages_per_request),
+            ("page_return_ring_capacity", self.page_return_ring_capacity),
             ("world_size", self.world_size),
             ("rank", self.mpi_rank),
             ("cuda_cc", self.target_cc),
@@ -3076,6 +3121,14 @@ class PersistentKernel:
             "pinned_step",
             "pinned_inbox_tokens",
             "pinned_rid_at_row",
+            "pinned_comp_num_pages",
+            "pinned_comp_pages",
+            "pinned_req_num_prefix_pages",
+            "pinned_req_prefix_pages",
+            "pinned_page_return_ring",
+            "pinned_page_return_tail",
+            "pinned_page_return_head_mirror",
+            "pinned_page_free_count_mirror",
         ]
         meta_tensors_ptr = []
         for key in expected_order:
@@ -3201,6 +3254,14 @@ class PersistentKernel:
             meta_tensors.append(self.meta_tensors["pinned_step"])
             meta_tensors.append(self.meta_tensors["pinned_inbox_tokens"])
             meta_tensors.append(self.meta_tensors["pinned_rid_at_row"])
+            meta_tensors.append(self.meta_tensors["pinned_comp_num_pages"])
+            meta_tensors.append(self.meta_tensors["pinned_comp_pages"])
+            meta_tensors.append(self.meta_tensors["pinned_req_num_prefix_pages"])
+            meta_tensors.append(self.meta_tensors["pinned_req_prefix_pages"])
+            meta_tensors.append(self.meta_tensors["pinned_page_return_ring"])
+            meta_tensors.append(self.meta_tensors["pinned_page_return_tail"])
+            meta_tensors.append(self.meta_tensors["pinned_page_return_head_mirror"])
+            meta_tensors.append(self.meta_tensors["pinned_page_free_count_mirror"])
         meta_tensors_ptr = [tensor.data_ptr() for tensor in meta_tensors]
         profiler_buffer_ptr = (
             self.profiler_tensor.data_ptr() if self.profiler_tensor is not None else 0
