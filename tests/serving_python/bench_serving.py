@@ -345,6 +345,7 @@ def summarize(results: list[Result], duration: float) -> dict:
         "itl_ms": {
             "median": round(percentile(itls, 50) * 1e3, 2),
             "p95": round(percentile(itls, 95) * 1e3, 2),
+            "p99": round(percentile(itls, 99) * 1e3, 2),
             "samples": len(itls),
             "poll_floor_ms": ITL_POLL_FLOOR_MS,
         },
@@ -452,6 +453,7 @@ ROWS = (
     ("TTFT p99 (ms)", lambda s: f"{s['ttft_ms']['p99']:.1f}"),
     ("ITL median (ms)", lambda s: f"{s['itl_ms']['median']:.1f}"),
     ("ITL p95 (ms)", lambda s: f"{s['itl_ms']['p95']:.1f}"),
+    ("ITL p99 (ms)", lambda s: f"{s['itl_ms']['p99']:.1f}"),
     ("TPOT mean (ms)", lambda s: f"{s['tpot_ms']['mean']:.1f}"),
     ("E2E p50 (ms)", lambda s: f"{s['e2e_ms']['p50']:.1f}"),
     ("E2E p95 (ms)", lambda s: f"{s['e2e_ms']['p95']:.1f}"),
