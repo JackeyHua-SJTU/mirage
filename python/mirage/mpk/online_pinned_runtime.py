@@ -13,21 +13,25 @@ Both rings carry the OIPL page-lifecycle payload: a completion also reports the
 request's final KV page list, and a request also carries the prefix pages the
 CPU wants imported.  KV page ownership is inverted — the GPU allocates pages
 but never releases them, so every exported page is returned to the GPU by the
-CPU, through :attr:`_page_return_ring`.  This runtime returns each page as soon
-as it is exported; a prefix cache keeps some of them back instead.
+CPU, through :attr:`_page_return_ring`.  With the prefix cache enabled the
+return is no longer a pass-through: a completed request's frozen prompt pages
+are indexed instead of returned, and a later request that shares that prompt
+prefix imports them and skips the prefill.
 
 Each ring slot has its own independent pinned inbox buffer, so concurrent
 submits can write prompt tokens without overwriting each other.  The GPU
 copies inbox tokens to the assigned buffer row when admitting a request.
 
-A single *owner thread* drives both rings.  :meth:`submit` only appends
-``(rid, token_ids, initial_step)`` to a CPU-side admission deque; every owner
-tick then reaps completions (page accounting, page return) and publishes as
-many queued requests as the ring has free slots.  Request threads never touch
-the request ring, so the ring publish -- and, once the prefix cache is wired
-in, the match/insert/evict that must be atomic with it -- happen on one thread
-with no lock hierarchy to get wrong.  The price is up to one tick (0.2 ms) of
-admission latency, which is noise next to a kernel iteration.
+A single *owner thread* drives both rings.  :meth:`submit` only appends the
+request to a CPU-side admission deque; every owner
+tick then reaps completions (page accounting, cache insert, page return),
+trims the cache, and publishes as many queued requests as the ring has free
+slots.  Request threads never touch the request ring, so the ring publish and
+the match/refcount/prefix-array write that must be atomic with it happen on one
+thread with no lock hierarchy to get wrong.  A queued request holds nothing --
+the match happens at the publish moment, not at enqueue -- so it can never pin
+pages the ring head needs.  The price is up to one tick (0.2 ms) of admission
+latency, which is noise next to a kernel iteration.
 
 Usage::
 
@@ -45,19 +49,44 @@ import collections
 import logging
 import threading
 import time
-from typing import Deque, Dict, List, Tuple
+from dataclasses import dataclass
+from typing import Deque, Dict, List, Optional, Sequence, Tuple
 
 import torch
 
 from .persistent_kernel import max_pages_per_request
+from .prefix_cache import EMPTY_MATCH, Block, PrefixCache, PrefixMatch
 
 logger = logging.getLogger(__name__)
+
+# Owner ticks (≈0.2 ms each) the oldest published request may stay unadmitted
+# before the cache starts handing the page pool back one block at a time
+# (§6.4 v2.1-c).  50 ticks ≈ 10 ms is an order of magnitude above one kernel
+# iteration, so a merely busy GPU never trips it.
+PREFIX_CACHE_STALL_TICKS = 50
+
+
+@dataclass
+class _Published:
+    """A request sitting on the request ring: what it pinned, what it will cache."""
+
+    rid: int
+    slot: int
+    npp: int
+    blocks: Tuple[Block, ...]
+    prompt_ids: Optional[List[int]]
 
 
 class OnlinePinnedRuntime:
     """CPU-side helper for the online_pinned persistent kernel mode."""
 
-    def __init__(self, mpk):
+    def __init__(
+        self,
+        mpk,
+        enable_prefix_cache: bool = False,
+        prefix_cache_pages: int = 0,
+        gen_tail_len: int = 0,
+    ):
         assert mpk.metadata.mode == "online_pinned", (
             f"OnlinePinnedRuntime requires mode='online_pinned', got {mpk.metadata.mode}"
         )
@@ -114,8 +143,27 @@ class OnlinePinnedRuntime:
         # and is published by the owner thread.  Holding a request here costs
         # nothing -- no ring slot, no page pin -- so a queued request can never
         # wedge admission.
-        self._admission: Deque[Tuple[int, torch.Tensor, int]] = collections.deque()
+        self._admission: Deque[
+            Tuple[int, torch.Tensor, int, Optional[List[int]]]
+        ] = collections.deque()
         self._admission_lock = threading.Lock()
+
+        # Prefix cache and its owner-thread-private bookkeeping.  ``_published``
+        # holds what each published request pinned until its completion is
+        # reaped; ``_unadmitted`` is the oldest-first view of it the pin budget
+        # (v2.1-a) and the stall detector (v2.1-c) need.
+        self._cache: Optional[PrefixCache] = None
+        if enable_prefix_cache:
+            self._cache = PrefixCache(
+                page_size=self._page_size,
+                total_pages=self._max_num_pages,
+                max_pages_per_req=self._pages_per_req,
+                capacity_pages=prefix_cache_pages or None,
+                stall_ticks=PREFIX_CACHE_STALL_TICKS,
+            )
+        self._gen_tail_len = gen_tail_len
+        self._published: Dict[int, _Published] = {}
+        self._unadmitted: Deque[_Published] = collections.deque()
 
         # Dedicated stream for HtoD / DtoH copies.
         self._write_stream = torch.cuda.Stream(device=mpk.tokens.device)
@@ -161,14 +209,20 @@ class OnlinePinnedRuntime:
         ----------
         rid          : unique request identifier (never repeats)
         token_ids    : 1-D int64 tensor of token IDs (CPU or CUDA)
-        initial_step : starting decode step (0 unless prefix-cache is used)
+        initial_step : starting decode step; leave at 0 to let the prefix cache
+                       pick one.  A caller-chosen start disables matching for
+                       that request, since the two cannot both set it.
         """
         self._raise_drain_error()
+        # The prefix cache keys on plain ints, and this is the last thread that
+        # can pay for the conversion without stealing owner-tick time.
+        prompt_ids = token_ids.tolist() if self._cache is not None else None
         with self._admission_lock:
-            self._admission.append((rid, token_ids.clone(), initial_step))
+            self._admission.append(
+                (rid, token_ids.clone(), initial_step, prompt_ids))
 
     def _publish_admissions(self) -> int:
-        """Publish queued requests while the ring has free slots.
+        """Match, pin and publish queued requests while the ring has free slots.
 
         Owner-serial: the caller holds ``_owner_lock``, which makes this the
         request ring's single producer, so a slot can never be claimed twice
@@ -184,19 +238,88 @@ class OnlinePinnedRuntime:
             with self._admission_lock:
                 if not self._admission:
                     break
-                rid, token_ids, initial_step = self._admission.popleft()
+                entry = self._admission.popleft()
+            rid, token_ids, initial_step, prompt_ids = entry
+            match = self._match_at_publish(prompt_ids, initial_step)
+            if not self._staging_room(match.num_prefix_pages):
+                # The GPU would refuse this request at its admission gate and
+                # the slot would sit ready until it stopped refusing.  Put the
+                # request back in the queue, where it pins nothing, and let the
+                # cache tick hand the pool back instead.
+                self._release_match(match)
+                with self._admission_lock:
+                    self._admission.appendleft(entry)
+                self._page_stats["publish_holds"] += 1
+                break
+            if match.num_prefix_pages:
+                # v2.1-(0): the kernel reads the prefill start from its own
+                # channel, so the two are derived together, here, or Step 4
+                # skips a prefill it has no imported pages for.
+                initial_step = match.num_prefix_pages * self._page_size
             try:
-                self._publish_request_locked(slot, rid, token_ids, initial_step)
+                self._publish_request_locked(
+                    slot, rid, token_ids, initial_step, match.page_ids)
             except Exception as exc:
                 # A request the CPU cannot stage (an over-long prompt, say)
                 # must not take the owner thread down with it: record the
-                # failure against its rid so its waiter raises, and carry on
-                # with the rest of the queue.  The slot is untouched.
+                # failure against its rid so its waiter raises, drop the pins it
+                # will now never export, and carry on with the rest of the
+                # queue.  The slot is untouched.
+                self._release_match(match)
                 self._fail_request(rid, exc)
                 continue
+            # Per-publish hit rate.  The cache's own hits/misses count match
+            # attempts, and a request the watermark holds is matched again on
+            # the next tick, so only these two are one-per-request.
+            if match.num_prefix_pages:
+                self._page_stats["publish_hits"] += 1
+                self._page_stats["imported_pages"] += match.num_prefix_pages
+            else:
+                self._page_stats["publish_misses"] += 1
+            info = _Published(rid, slot, match.num_prefix_pages,
+                              match.blocks, prompt_ids)
+            self._published[rid] = info
+            self._unadmitted.append(info)
             self._cpu_req_tail += 1
             published += 1
         return published
+
+    def _match_at_publish(
+        self, prompt_ids: Optional[List[int]], initial_step: int
+    ) -> PrefixMatch:
+        """Longest cached prefix of this request, pinned, clamped to the budget.
+
+        Match and pin happen inside the publish loop rather than at submit
+        time: a queued request that already held refcounts could pin the pages
+        the ring head needs to be admitted and wedge the pool (§10-3).
+        """
+        if self._cache is None or prompt_ids is None or initial_step != 0:
+            return EMPTY_MATCH
+        budget = self._cache.publish_pin_budget(
+            [info.npp for info in self._unadmitted])
+        return self._cache.match(prompt_ids, budget)
+
+    def _release_match(self, match: PrefixMatch) -> None:
+        """Give back pins taken for a publish that did not happen."""
+        if self._cache is not None and match.blocks:
+            self._cache.release(match.blocks)
+
+    def _staging_room(self, num_prefix_pages: int) -> bool:
+        """Advisory watermark: can the GPU still admit one more publish?
+
+        The estimate is the free-page mirror plus what is still in flight in
+        the return ring.  Both mirrors are published together at the end of a
+        GPU iteration, so the in-flight pages are not double counted, but the
+        estimate ignores the pages the ledger has reserved for already admitted
+        requests -- it is an upper bound, and the GPU's admission gate (§6.3a)
+        is the safety net, not this (§10-1).  With nothing published there is
+        nothing to wait for and no stall for the cache tick to react to, so the
+        head request always goes out.
+        """
+        if self._cache is None or not self._unadmitted:
+            return True
+        estimate = self.gpu_free_page_count + self.pending_page_returns
+        return estimate >= self._pages_per_req - num_prefix_pages
 
     def _fail_request(self, rid: int, exc: Exception) -> None:
         """Record that *rid* could never be published; its waiter will raise."""
@@ -210,8 +333,16 @@ class OnlinePinnedRuntime:
         rid: int,
         token_ids: torch.Tensor,
         initial_step: int,
+        prefix_pages: Sequence[int] = (),
     ) -> None:
-        """Copy and publish one request from the owner tick."""
+        """Copy and publish one request from the owner tick.
+
+        *prefix_pages* are the cached pages the GPU should import in place of
+        allocating fresh ones; *initial_step* must be ``len(prefix_pages) *
+        page_size`` (v2.1-(0)).  Everything is written before the single
+        release-store of ``ready``, which is what makes the whole payload --
+        prefix array included -- visible to Step 4 as one unit.
+        """
         prompt_len = token_ids.shape[0]
         with torch.cuda.stream(self._write_stream):
             self._inbox_tokens[slot, :prompt_len].copy_(
@@ -220,8 +351,10 @@ class OnlinePinnedRuntime:
         self._req_request_id[slot] = rid
         self._req_prompt_len[slot] = prompt_len
         self._req_initial_step[slot] = initial_step
-        # No prefix import: the GPU allocates the whole page table itself.
-        self._req_num_prefix_pages[slot] = 0
+        base = slot * self._pages_per_req
+        for offset, page in enumerate(prefix_pages):
+            self._req_prefix_pages[base + offset] = page
+        self._req_num_prefix_pages[slot] = len(prefix_pages)
         self._store_i32_release(self._req_ready, slot, 1)
 
     def drain_completions(self) -> List[Tuple[int, int, int]]:
@@ -240,15 +373,45 @@ class OnlinePinnedRuntime:
             return self._owner_tick()
 
     def _owner_tick(self) -> List[Tuple[int, int, int]]:
-        """One pass of the owner thread: reap completions, then publish.
+        """One pass of the owner thread: observe, reap, trim, publish.
 
-        The caller holds ``_owner_lock``.  Completions come first so the pages
-        and ring slots they free are available to the requests published in the
-        same tick.
+        The caller holds ``_owner_lock``.  Observing admissions first keeps
+        ``_unadmitted`` a subset of ``_published``, which the reap then pops
+        from; completions come before publishes so the pages and ring slots
+        they free are available to the requests published in the same tick.
         """
+        self._observe_admissions()
         finished = self._reap_completions()
+        self._cache_tick()
         self._publish_admissions()
         return finished
+
+    def _observe_admissions(self) -> None:
+        """Retire published requests the GPU has taken off the ring.
+
+        The GPU drains the request ring in FIFO order and clears ``ready`` at
+        the end of the admit body, so ``ready == 0`` on the oldest published
+        slot means exactly "that request was admitted".  No extra channel is
+        needed for the CPU to see admission (§6.4 v2.1-a).
+        """
+        while self._unadmitted:
+            if self._load_i32_acquire(
+                    self._req_ready, self._unadmitted[0].slot) != 0:
+                break
+            self._unadmitted.popleft()
+
+    def _cache_tick(self) -> None:
+        """Trim the cache to budget and react to a stalled ring head.
+
+        Resident pages hold the GPU's ``avail_uncommitted`` down 1:1 and the
+        GPU has no "I am starving" channel, so a cache that never reacts to an
+        unadmitted ring head can park admission indefinitely without breaking
+        any invariant (§6.4 v2.1-c).
+        """
+        if self._cache is None:
+            return
+        oldest = self._unadmitted[0].rid if self._unadmitted else None
+        self._return_pages_locked(self._cache.tick(oldest))
 
     def _reap_completions(self) -> List[Tuple[int, int, int]]:
         """Collect every completion the GPU has published since the last tick."""
@@ -262,10 +425,12 @@ class OnlinePinnedRuntime:
                 buffer_row  = int(self._comp_buffer_row[slot].item())
                 final_step  = int(self._comp_final_step[slot].item())
                 # Page accounting is unconditional: the pages of an abandoned
-                # request must come back just like any other.  It runs before
-                # the ready clear, while the exported ids are still the GPU's
+                # request must be cached or come back just like any other --
+                # only session delivery is conditional.  It runs before the
+                # ready clear, while the exported ids are still the GPU's
                 # published payload for this slot.
-                self._return_pages_locked(
+                self._account_pages_locked(
+                    rid, final_step,
                     self._check_exported_pages(slot, rid, final_step))
                 if rid in self._abandoned:
                     self._release_row_locked(rid, buffer_row)
@@ -278,6 +443,31 @@ class OnlinePinnedRuntime:
                 self._cpu_comp_head += 1
             finished.append((rid, buffer_row, final_step))
         return finished
+
+    def _account_pages_locked(
+        self, rid: int, final_step: int, pages: List[int]
+    ) -> None:
+        """Cache what this completion froze; return everything else.
+
+        The exported pages are the request's whole page table, so page ``j``
+        holds prompt tokens ``[j*PS, (j+1)*PS)``.  Below ``npp`` they are the
+        pages the request imported -- their pin drops here; above it they are
+        fresh, and the ones entirely inside the cacheable prompt range extend
+        the chain.  The rest go to the return ring, as they always did.
+        """
+        info = self._published.pop(rid, None)
+        if self._cache is None or info is None or info.prompt_ids is None:
+            self._return_pages_locked(pages)
+            return
+        # An export the CPU could not read (a page-count anomaly) leaves this
+        # request's pins with no page to drop them against; drop them here or
+        # the blocks stay pinned for the life of the cache.
+        exported = set(pages)
+        stranded = [b for b in info.blocks if b.page_id not in exported]
+        self._return_pages_locked(self._cache.insert(
+            info.prompt_ids, pages, final_step, self._gen_tail_len,
+            num_prefix_pages=info.npp))
+        self._cache.release(stranded)
 
     def _check_exported_pages(self, slot: int, rid: int, final_step: int) -> List[int]:
         """Reconcile one completion's exported KV page list.
@@ -357,9 +547,24 @@ class OnlinePinnedRuntime:
 
     @property
     def page_stats(self) -> Dict[str, int]:
-        """Snapshot of the page-export reconciliation counters."""
+        """Page-export reconciliation counters, merged with the cache's.
+
+        Cache counters are prefixed ``cache_``.  They live on the owner
+        thread's private structures, so this takes ``_owner_lock`` -- after
+        releasing ``_lock``, never nested inside it -- and may block a caller
+        for up to one tick.
+        """
         with self._lock:
-            return dict(self._page_stats)
+            stats = dict(self._page_stats)
+        with self._owner_lock:
+            stats["published_unadmitted"] = len(self._unadmitted)
+            cache_stats = None if self._cache is None else self._cache.stats()
+        stats["cache_enabled"] = int(cache_stats is not None)
+        if cache_stats is not None:
+            stats["cache_capacity_pages"] = self._cache.capacity_pages
+            stats.update(("cache_" + key, value)
+                         for key, value in cache_stats.items())
+        return stats
 
     @property
     def gpu_free_page_count(self) -> int:
@@ -537,6 +742,13 @@ class OnlinePinnedRuntime:
             self._cpu_req_ack = 0
             with self._admission_lock:
                 self._admission.clear()
+            self._published.clear()
+            self._unadmitted.clear()
+            if self._cache is not None:
+                # The relaunched kernel refills page_queue with every page, so
+                # the resident pages this hands back are already the GPU's; the
+                # index simply stops claiming them.
+                self._cache.reset()
             self._req_ready.zero_()
             self._req_request_id.zero_()
             self._req_num_prefix_pages.zero_()

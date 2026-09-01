@@ -16,6 +16,7 @@ from ..mpk.persistent_kernel import (
     max_pages_per_request,
     page_return_ring_capacity,
 )
+from ..mpk.prefix_cache import compute_gen_tail_len
 
 
 # ── Configuration ─────────────────────────────────────────────────────────────
@@ -47,6 +48,14 @@ class RunnerConfig:
 
     output_dir: Optional[str] = None
     """Directory for compiled kernel artefacts; ``None`` uses a temp dir."""
+
+    enable_prefix_cache: bool = False
+    """Re-import a completed request's frozen prompt KV pages (OIPL §6.4)."""
+
+    prefix_cache_pages: int = 0
+    """Resident-page budget for that cache.  ``0`` auto-sizes it to
+    ``max_num_pages - ceil(max_seq_length / page_size)``, the largest cache that
+    still leaves one worst-case request admissible."""
 
     use_cutlass_kernel: bool = True
 
@@ -98,8 +107,20 @@ class ModelRunner:
         )
         self.mpk = MPK(mpk_meta)
         self.mpk.build()
-        self.runtime = OnlinePinnedRuntime(self.mpk)
         self.tokenizer = self.mpk.tokenizer
+        # The chat template re-renders the generation prompt every turn, so the
+        # tail it inserts is not a stable prefix of the next turn (§11-1);
+        # measuring it once here keeps it out of the cacheable range.
+        gen_tail_len = (
+            compute_gen_tail_len(self.tokenizer)
+            if config.enable_prefix_cache else 0
+        )
+        self.runtime = OnlinePinnedRuntime(
+            self.mpk,
+            enable_prefix_cache=config.enable_prefix_cache,
+            prefix_cache_pages=config.prefix_cache_pages,
+            gen_tail_len=gen_tail_len,
+        )
         self.mpk.compile(output_dir=config.output_dir)
 
     # ── Execution ─────────────────────────────────────────────────────────────

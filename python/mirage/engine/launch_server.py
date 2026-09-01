@@ -183,6 +183,11 @@ def main():
     parser.add_argument("--max-seq-length", default=512, type=int)
     parser.add_argument("--max-num-pages", default=16, type=int)
     parser.add_argument("--page-size", default=4096, type=int)
+    parser.add_argument("--enable-prefix-cache", action="store_true",
+                        help="Re-import completed requests' prompt KV pages")
+    parser.add_argument("--prefix-cache-pages", default=0, type=int,
+                        help="Resident pages for that cache (0 = auto: "
+                             "max_num_pages - ceil(max_seq_length/page_size))")
     parser.add_argument("--output-dir", default=None, help="Output directory for compiled artifacts")
     parser.add_argument("--request-timeout", default=7200.0, type=float,
                         help="Per-request timeout in seconds (default: 7200)")
@@ -196,6 +201,8 @@ def main():
         max_seq_length=args.max_seq_length,
         max_num_pages=args.max_num_pages,
         page_size=args.page_size,
+        enable_prefix_cache=args.enable_prefix_cache,
+        prefix_cache_pages=args.prefix_cache_pages,
         output_dir=args.output_dir,
     )
     app.state.runner_config = config
