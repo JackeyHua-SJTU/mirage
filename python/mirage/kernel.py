@@ -81,7 +81,11 @@ static struct PyModuleDef ModuleDef = {
   "__mirage_launcher",
   NULL, //documentation
   -1, //size
-  ModuleMethods
+  ModuleMethods,
+  nullptr,                  // m_slots     
+  nullptr,                  // m_traverse  
+  nullptr,                  // m_clear     
+  nullptr,                  // m_free      
 };
 
 PyMODINIT_FUNC PyInit___mirage_launcher(void) {
@@ -139,6 +143,7 @@ def get_cc_cmd(
         f"-I{py_include_dir}",
         f"-I{os.path.join(INCLUDE_PATH, 'mirage/transpiler/runtime')}",
         f"-I{os.path.join(DEPS_PATH, 'cutlass/include')}",
+        "-DMIRAGE_BACKEND_USE_CUDA",
         "-shared",
         "-std=c++17",
         "-use_fast_math",
@@ -153,6 +158,11 @@ def get_cc_cmd(
         specific_cmd = [
             "-arch=sm_90a",
             "-gencode=arch=compute_90a,code=sm_90a",
+        ] + (["-DMIRAGE_ENABLE_PROFILER"] if profiling else [])
+    elif target == 100:
+        specific_cmd = [
+            "-arch=sm_100a",
+            "-gencode=arch=compute_100a,code=sm_100a",
         ] + (["-DMIRAGE_ENABLE_PROFILER"] if profiling else [])
     else:
         specific_cmd = [
@@ -220,9 +230,9 @@ class KNGraph:
             strides = reversed(strides)
         else:
             assert len(dims) == len(strides)
-            assert check_stride(dims, strides, "row-major") | check_stride(
-                dims, strides, "column-major"
-            )
+            # assert check_stride(dims, strides, "row-major") | check_stride(
+            #     dims, strides, "column-major"
+            # )
         return self.cygraph.new_input(dims, tuple(strides), dtype)
 
     def mark_output(self, A: DTensor, strides: tuple = None):
@@ -351,7 +361,7 @@ class KNGraph:
             for meta in results["output_directives"]
         ]
 
-        prodiler_buffer_tensor = torch.empty(
+        profiler_buffer_tensor = torch.empty(
             results["profiler_buf_size"],
             dtype=torch.uint64,
             device=input_tensors[0].device,
@@ -360,13 +370,13 @@ class KNGraph:
         buffer_tensor_ptr = buffer_tensor.data_ptr()
         input_tensors_ptr = [tensor.data_ptr() for tensor in input_tensors]
         output_tensors_ptr = [tensor.data_ptr() for tensor in output_tensors]
-        prodiler_buffer_tensor_ptr = prodiler_buffer_tensor.data_ptr()
+        profiler_buffer_tensor_ptr = profiler_buffer_tensor.data_ptr()
         self.run(
             input_tensors_ptr,
             output_tensors_ptr,
             buffer_tensor_ptr,
             stream.cuda_stream,
-            prodiler_buffer_tensor_ptr,
+            profiler_buffer_tensor_ptr,
         )
 
         if results["profiler_buf_size"] > 0:
@@ -377,7 +387,7 @@ class KNGraph:
                 profiler_result_dir, "mirage.perfetto-trace"
             )
             os.makedirs(profiler_result_dir, exist_ok=True)
-            export_to_perfetto_trace(prodiler_buffer_tensor, profiler_result_file)
+            export_to_perfetto_trace(profiler_buffer_tensor, profiler_result_file)
             print(
                 f"Exported profiling results to {profiler_result_file}, please view it with perfetto: https://ui.perfetto.dev/"
             )
@@ -546,6 +556,7 @@ class KNGraph:
         use_graph_dataset: bool = True,
         use_cached_graphs: bool = True,
         save_codes: bool = False,
+        is_formal_verified: bool = False,
     ):
         if use_graph_dataset:
             cached_graph = graph_dataset.find(
@@ -568,6 +579,7 @@ class KNGraph:
             previous_checkpoint = None
         cygraphs = search(
             self.cygraph,
+            backend=backend,
             imaps=imaps,
             omaps=omaps,
             griddims=griddims,
@@ -577,6 +589,7 @@ class KNGraph:
             previous_checkpoint=previous_checkpoint,
             verbose=verbose,
             default_config=config,
+            is_formal_verified=is_formal_verified,
         )
         all_graphs = [KNGraph(g) for g in cygraphs]
         print("Finished search, discovering {} mugraphs ...".format(len(all_graphs)))
@@ -612,8 +625,6 @@ class KNGraph:
                                 )
                                 x = torch.as_strided(x, size=dims, stride=strides)
                                 input_tensors.append(x)
-                            starter = torch.cuda.Event(enable_timing=True)
-                            ender = torch.cuda.Event(enable_timing=True)
                             new_g = g
                             if len(handles) == MAX_THREADS:
                                 handles.popleft().wait()
@@ -639,8 +650,6 @@ class KNGraph:
                         )
                         x = torch.as_strided(x, size=dims, stride=strides)
                         input_tensors.append(x)
-                    starter = torch.cuda.Event(enable_timing=True)
-                    ender = torch.cuda.Event(enable_timing=True)
                     if len(handles) == MAX_THREADS:
                         handles.popleft().wait()
                     handle = g.compile(async_=True, inputs=input_tensors)
@@ -774,6 +783,21 @@ class KNGraph:
         self, input: list[DTensor], fuse_dim: int, num_groups: int, name: str
     ):
         return self.cygraph.fuse_tensors(input, fuse_dim, num_groups, name)
+
+    def shuffle_tensors(
+        self, input: list[DTensor], shuffled_dim: int, num_groups: int, name: str
+    ):
+        return self.cygraph.shuffle_tensors(input, shuffled_dim, num_groups, name)
+
+    # Virtual-tensor (view) operations
+    def view(self, input: DTensor, new_shape: list) -> DTensor:
+        return self.cygraph.view(input, list(new_shape))
+
+    def narrow(self, input: DTensor, dim: int, start: int, length: int) -> DTensor:
+        return self.cygraph.narrow(input, dim, start, length)
+
+    def split(self, input: DTensor, sizes_or_chunks, dim: int) -> list:
+        return self.cygraph.split(input, sizes_or_chunks, dim)
 
     def register_task(self, bgraph: TBGraph, task_type: str, params: list[int] = None):
         return self.cygraph.register_task(bgraph.cygraph, task_type, params)

@@ -16,9 +16,54 @@
 #pragma once
 
 #include "mirage/config.h"
+#include <cuda_runtime.h>
+
+#ifdef USE_NVSHMEM
+#include <nvshmem.h>
+#include <nvshmemx.h>
+#endif
 
 namespace mirage {
 namespace runtime {
+
+#if defined(MIRAGE_GRACE_HOPPER) || defined(MIRAGE_GRACE_BLACKWELL)
+constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 6 * 1024;
+#else
+constexpr int WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE = 3 * 1024;
+#endif
+
+#if defined(MODE_ONLINE_NOTOKEN) || defined(MODE_MULTI_TURN)
+// Have to be smaller for vllm compatibility, or program will stuck
+#if MPK_TARGET_CC >= 90
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    220 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#elif MPK_TARGET_CC >= 86
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    99 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#elif MPK_TARGET_CC >= 80
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    160 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#else
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    163 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#endif
+#else
+#if MPK_TARGET_CC >= 90
+// B200: 228KB total smem. PR 651 MLA reduce adds ~16KB static smem
+// (la_smem[MAX_SK*128]). Reduce dynamic budget to stay under total limit.
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    207 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#elif MPK_TARGET_CC >= 86
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    99 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#elif MPK_TARGET_CC >= 80
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    163 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#else
+constexpr int MAX_DYNAMIC_SHARED_MEMORY_SIZE =
+    163 * 1024 - WORKER_RESERVED_STATIC_SHARED_MEMORY_SIZE;
+#endif
+#endif
 
 typedef unsigned long long int TaskId;
 unsigned long long int const TASK_INVALID_ID = 0x7fffffffffffffff;
@@ -31,9 +76,10 @@ unsigned long long int const EVENT_NVSHMEM_TAG = 0x1e00000000000000;
 unsigned long long int const EVENT_INVALID_ID = 0x7ffffffffffffffe;
 typedef unsigned long long int EventCounter;
 
-int const MAX_INPUTS_PER_TASK = 7;
-int const MAX_OUTPUTS_PER_TASK = 2;
-int const MAX_NUM_WORKERS = 128;
+int const MAX_INPUTS_PER_TASK = 8;
+int const MAX_OUTPUTS_PER_TASK = 3;
+// B200 has 148 SMs — need more workers than the default 128
+int const MAX_NUM_WORKERS = 160;
 
 enum TaskType {
   TASK_TERMINATE = 0,
@@ -44,17 +90,133 @@ enum TaskType {
   TASK_ATTENTION_1 = 103,
   TASK_ATTENTION_2 = 104,
   TASK_SILU_MUL_LINEAR_WITH_RESIDUAL = 105,
-  TASK_ALLREDUCE = 106,
+  TASK_ALLREDUCE = 106, // This legacy allreduce task will be removed soon
   TASK_REDUCE = 107,
   TASK_LINEAR_WITH_RESIDUAL = 108,
   TASK_ARGMAX = 109,
   TASK_ARGMAX_PARTIAL = 110,
   TASK_ARGMAX_REDUCE = 111,
-  TASK_NVSHMEM_COPY = 199,
+  TASK_FIND_NGRAM_PARTIAL = 112,
+  TASK_FIND_NGRAM_GLOBAL = 113,
+  TASK_TARGET_VERIFY_GREEDY = 114,
+  TASK_SINGLE_BATCH_EXTEND_ATTENTION = 115,
+  TASK_PAGED_ATTENTION_1 = 116,
+  TASK_PAGED_ATTENTION_2 = 117,
+  TASK_SILU_MUL = 118,
+  TASK_RMS_NORM = 119,
+  TASK_LINEAR = 120,
+  TASK_IDENTITY = 121,
+  // Hopper Tasks
+  TASK_HOPPER_TASK_BEGIN = 150, // Hopper start placeholder, not a real task
+  TASK_LINEAR_WITH_RESIDUAL_HOPPER = 151,
+  TASK_LINEAR_HOPPER = 152,
+  TASK_PAGED_ATTENTION_HOPPER = 153,
+  TASK_RMS_NORM_HOPPER = 154,
+  TASK_LINEAR_SWAPAB_HOPPER = 155,
+  TASK_LINEAR_SWAPAB_WITH_RESIDUAL_HOPPER = 156,
+  TASK_LINEAR_CUTLASS_HOPPER = 157,
+  TASK_LINEAR_CUTLASS_WITH_RESIDUAL_HOPPER = 158,
+  TASK_SILU_MUL_HOPPER = 159,
+  TASK_EMBEDDING_HOPPER = 160,
+  TASK_MOE_W13_LINEAR_SM90 = 161,
+  TASK_MOE_W2_LINEAR_SM90 = 162,
+  TASK_SPLITK_LINEAR_SWAPAB_HOPPER = 163,
+  TASK_PAGED_ATTENTION_SPLIT_KV_HOPPER = 164,
+  TASK_HOPPER_TASK_END = 198, // Hopper end placeholder, not a real task
+  // SM100 Tasks
+  TASK_SM100_TASK_BEGIN = 230, // SM100 start placeholder, not a real task
+  TASK_SM100_TMA_START_TASK = 231,
+  TASK_COPY = 232,
+  TASK_CONCAT = 233,
+  TASK_EAGLE3_D2T_REMAP = 235,
+  TASK_EAGLE3_COMMIT = 236,
+  TASK_MOE_W13_FP8_SM100 = 248,
+  TASK_MOE_W2_FP8_SM100 = 249,
+  TASK_SPLITK_LINEAR_SM100 = 251,
+  TASK_LINEAR_WITH_RESIDUAL_SM100 = 252,
+  TASK_LINEAR_SM100 = 253,
+  TASK_MOE_W13_LINEAR_SM100 = 254,
+  TASK_MOE_W2_LINEAR_SM100 = 255,
+  TASK_SM100_TMA_END_TASK = 256,
+  TASK_ATTN_SM100 = 257,
+  TASK_ARGMAX_REDUCE_SM100 = 258,
+  TASK_ARGMAX_PARTIAL_SM100 = 259,
+  TASK_MOE_TOPK_SOFTMAX_SM100 = 260,
+  TASK_MOE_MUL_SUM_ADD_SM100 = 261,
+  TASK_TENSOR_INIT = 262,
+  TASK_PAGED_ATTENTION_SPLIT_KV_SM100 = 263,
+  TASK_PAGED_ATTENTION_SPLIT_KV_MERGE_SM100 = 264,
+  TASK_SAMPLING_SM100 = 265,
+  TASK_MLA_DECODE_SM100 = 266,
+  TASK_MLA_REDUCE_SM100 = 267,
+  TASK_MLA_PREFILL_SM100 = 268,
+  TASK_MLA_MTP_DECODE_SM100 = 269,
+  TASK_MLA_MTP_REDUCE_SM100 = 270,
+  TASK_MTP_VERIFY_STRICT = 271,
+  TASK_MTP_ACCEPT_COMMIT = 272,
+  TASK_MTP_TOKEN_SCATTER = 273,
+  TASK_MTP_PREPARE_VERIFY = 274,
+  TASK_QUANTIZE_FP8_SM100 = 275,
+  TASK_LINEAR_FP8_SM100 = 276,
+  TASK_LINEAR_FP8_WITH_RESIDUAL_SM100 = 277,
+  TASK_MLA_KV_GATHER_SM100 = 278,
+  TASK_MOE_TOPK_SIGMOID_SM100 = 280,
+  TASK_ELEMENTWISE_ADD_SM100 = 281,
+  TASK_SOFTMAX_GATHER_SM100 = 282,
+  TASK_MTP_VERIFY_PROBABILISTIC = 283,
+  TASK_PROB_SCATTER_SM100 = 284,
+  TASK_MTP_FLOAT_SCATTER = 285,
+  TASK_PROB_EXTRACT_SM100 = 286,
+  // MLA-MTP TP variants (q1..q4, kv4096; ferret-derived, no-PDL):
+  TASK_MLA_MTP_DECODE_TP2_SM100 = 287,
+  TASK_MLA_MTP_DECODE_TP2_REDUCE_SM100 = 288,
+  TASK_MLA_MTP_DECODE_TP4_SM100 = 289,
+  TASK_MLA_MTP_DECODE_TP4_REDUCE_SM100 = 290,
+  TASK_MLA_MTP_DECODE_TP8_SM100 = 291,
+  TASK_MLA_MTP_DECODE_TP8_REDUCE_SM100 = 292,
+  // KV gather variant that writes split CKV/KPE output (for chunked prefill):
+  TASK_MLA_KV_GATHER_SPLIT_SM100 = 293,
+  // MTP embedding-input builder (vLLM-aligned): produces per-iteration MTP
+  // input tokens = shifted ground-truth prompt + current iter's argmax tail.
+  TASK_MTP_BUILD_EMBED_INPUT = 294,
+  // MLA prefill TP=8: unabsorbed, TMA K/V, seq_len<=4096.
+  TASK_MLA_PREFILL_TP8_SM100 = 295,
+  // DFlash non-causal block attention (correctness-first), SM100.
+  TASK_DFLASH_ATTENTION_SM100 = 296,
+  // DFlash per-head RMSNorm + RoPE, SM100.
+  TASK_DFLASH_NORM_ROPE_SM100 = 297,
+  // DFlash standalone paged KV-cache store (L4 materialize write), SM100.
+  TASK_DFLASH_KV_STORE_SM100 = 298,
+  TASK_SM100_TASK_END = 299, // SM100 end placeholder, not a real task
   TASK_SCHD_TASKS = 200,
   TASK_SCHD_EVENTS = 201,
   TASK_GET_EVENT = 202,
   TASK_GET_NEXT_TASK = 203,
+  TASK_SCHD_PREPARE_BATCH = 204,
+  // Multi-GPU tasks
+  TASK_MULTIGPU_TASK_BEGIN = 300, // begin placeholder, not a real task
+  TASK_NVSHMEM_ALLGATHER_STRIDED_PUT = 301,
+  TASK_NVSHMEM_TILE_ALLREDUCE = 302,
+  TASK_MULTIGPU_TASK_END = 349, // end placeholder, not a real task
+  // Inkling (Thinking Machines) tasks, SM100
+  TASK_INKLING_TASK_BEGIN = 350, // begin placeholder, not a real task
+  // Depthwise short conv (k=4) + residual, decode state updated in place.
+  TASK_INKLING_SCONV_SM100 = 351,
+  // Sigmoid top-6 + logsigmoid-softmax router with folded shared experts.
+  TASK_INKLING_MOE_ROUTER_SM100 = 352,
+  // GQA decode attention with relative-position bias + log scaling.
+  TASK_INKLING_ATTENTION_SM100 = 353,
+  TASK_INKLING_TASK_END = 399, // end placeholder, not a real task
+  // GLM-4.x (zai-org) tasks, SM100
+  TASK_GLM_TASK_BEGIN = 400, // begin placeholder, not a real task
+  // Sigmoid+bias top-k router (n_group=1) with folded shared expert.
+  TASK_GLM_MOE_ROUTER_SM100 = 401,
+  TASK_GLM_TASK_END = 449, // end placeholder, not a real task
+  // GPT-OSS (openai) tasks, SM100
+  TASK_GPT_OSS_TASK_BEGIN = 450, // begin placeholder, not a real task
+  // Clamped-alpha SwiGLU: (clamp(up) + 1) * clamp(gate) * sigmoid(gate*alpha)
+  TASK_CLAMPED_SWIGLU = 451,
+  TASK_GPT_OSS_TASK_END = 499, // end placeholder, not a real task
 };
 
 enum EventType {
@@ -70,6 +232,9 @@ enum EventType {
 struct TensorDesc {
   int num_dims;
   void *base_ptr;
+#ifdef MPK_ENABLE_TMA
+  void *tma_desc_ptrs[mirage::config::MAX_TMA_DESC_PER_TENSOR];
+#endif
   int data_type;
   int dim[mirage::config::MAX_TENSOR_DIMS];
   int stride[mirage::config::MAX_TENSOR_DIMS];
@@ -86,11 +251,15 @@ struct EventDesc {
   TaskId first_task_id, last_task_id;
 };
 
-struct TaskDesc {
-  TaskDesc(TaskType t, int _variant_id)
+struct FullTaskDesc {
+  FullTaskDesc(TaskType t, int _variant_id)
       : task_type(t), variant_id(_variant_id), num_inputs(0), num_outputs(0),
-        trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID) {}
-  TaskDesc() {}
+        trigger_event(EVENT_INVALID_ID), dependent_event(EVENT_INVALID_ID) {
+    task_metadata.raw_payload = ~0ull;
+  }
+  FullTaskDesc() {
+    task_metadata.raw_payload = ~0ull;
+  }
   TaskType task_type;
   unsigned variant_id;
   int num_inputs, num_outputs;
@@ -98,11 +267,72 @@ struct TaskDesc {
   EventId dependent_event;
   TensorDesc inputs[MAX_INPUTS_PER_TASK];
   TensorDesc outputs[MAX_OUTPUTS_PER_TASK];
+  union TaskMetadata {
+    struct {
+      int expert_offset; // Used for MoE
+    };
+    struct {
+      int16_t request_id;    // Used for paged attention
+      uint16_t kv_idx;       // Used for paged attention split kv
+      int merge_task_offset; // Used for paged attention split kv merge
+    };
+    struct {
+      int task_offset; // Used for nvshmem team mapping
+    };
+    unsigned long long raw_payload;
+  } task_metadata;
+};
+
+static_assert(
+    sizeof(FullTaskDesc::TaskMetadata) == sizeof(unsigned long long),
+    "FullTaskDesc::TaskMetadata layout changed; update raw_payload type.");
+
+struct alignas(16) TaskDesc {
+  TaskDesc(FullTaskDesc t)
+      : task_type(t.task_type), variant_id(t.variant_id),
+        trigger_event(t.trigger_event), dependent_event(t.dependent_event),
+        task_metadata(t.task_metadata) {
+    for (int i = 0; i < t.num_inputs; i++) {
+      input_ptrs[i] = t.inputs[i].base_ptr;
+    }
+    for (int i = 0; i < t.num_outputs; i++) {
+      output_ptrs[i] = t.outputs[i].base_ptr;
+    }
+#ifdef MPK_ENABLE_TMA
+    for (int i = 0; i < t.num_inputs; i++) {
+      for (int k = 0; k < mirage::config::MAX_TMA_DESC_PER_TENSOR; k++) {
+        input_tma_desc_ptrs[i][k] = t.inputs[i].tma_desc_ptrs[k];
+      }
+    }
+    for (int i = 0; i < t.num_outputs; i++) {
+      for (int k = 0; k < mirage::config::MAX_TMA_DESC_PER_TENSOR; k++) {
+        output_tma_desc_ptrs[i][k] = t.outputs[i].tma_desc_ptrs[k];
+      }
+    }
+#endif
+  }
+  TaskDesc() {
+    task_metadata.raw_payload = ~0ull;
+  }
+  TaskType task_type;
+  unsigned variant_id;
+  EventId trigger_event;
+  EventId dependent_event;
+  void *input_ptrs[MAX_INPUTS_PER_TASK];
+  void *output_ptrs[MAX_OUTPUTS_PER_TASK];
+#ifdef MPK_ENABLE_TMA
+  void *input_tma_desc_ptrs[MAX_INPUTS_PER_TASK]
+                           [mirage::config::MAX_TMA_DESC_PER_TENSOR];
+  void *output_tma_desc_ptrs[MAX_OUTPUTS_PER_TASK]
+                            [mirage::config::MAX_TMA_DESC_PER_TENSOR];
+#endif
+  FullTaskDesc::TaskMetadata task_metadata;
 };
 
 struct RuntimeConfig {
   int num_workers, num_local_schedulers, num_remote_schedulers, num_graphs;
   int num_gpus, my_gpu_id;
+  int num_events;
   unsigned long long int per_worker_queue_len, per_sched_queue_len;
   unsigned long long int *worker_queue_last_ready_task_id;
   unsigned long long int *sched_queue_last_ready_event_id;
@@ -114,13 +344,91 @@ struct RuntimeConfig {
   TaskId **worker_queues;
   EventId **sched_queues;
   TaskId *first_tasks;
-  int *step;              // Metadata for LLM serving
-  long long *tokens;      // Metadata for LLM serving
-  long long eos_token_id; // Metadata for LLM serving
-  int max_seq_length;     // Metadata for LLM serving
+  int *step;                      // Metadata for LLM serving
+  long long *tokens;              // Metadata for LLM serving
+  long long *input_tokens;        // Metadata for LLM serving
+  long long *output_tokens;       // Metadata for LLM serving
+  long long eos_token_id;         // Metadata for LLM serving
+  int max_seq_length;             // Metadata for LLM serving
+  int *new_token_nums;            // Metadata for LLM serving
+  int *qo_indptr_buffer;          // Metadata for LLM serving (paged attention)
+  int *paged_kv_indptr_buffer;    // Metadata for LLM serving (paged attention)
+  int *paged_kv_indices_buffer;   // Metadata for LLM serving (paged attention)
+  int *paged_kv_indices_snapshot; // Scheduler snapshot for in-place compaction
+  int *paged_kv_last_page_len_buffer; // Metadata for LLM serving
+#if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \
+    defined(MODE_ONLINE_NOTOKEN) || defined(MODE_ONLINE_TEST) ||               \
+    defined(MODE_ONLINE_PINNED)
+  int *prompt_length;     // Metadata for online/offline serving
+  int *request_ids;       // Metadata for online/offline serving
+  int *page_queue;        // Metadata for online/offline serving
+  int *page_queue_head;   // Metadata for online/offline serving
+  int *page_queue_tail;   // Metadata for online/offline serving
+  int total_num_requests; // Metadata for LLM serving
+#endif
+#if defined(MODE_OFFLINE) || defined(MODE_ONLINE) ||                           \
+    defined(MODE_ONLINE_NOTOKEN) || defined(MODE_ONLINE_TEST)
+  int *next_request_id; // Metadata for LLM serving (not used in PINNED mode)
+#endif
+#if defined(MODE_ONLINE_TEST)
+  // P3: written by the kernel when a request completes so Python can insert
+  // the final KV pages into the prefix cache.
+  // final_paged_kv_num_pages[request_id]                  : page count
+  // final_paged_kv_indices [request_id * MPK_MAX_NUM_PAGES + j] : page index j
+  int *final_paged_kv_num_pages;
+  int *final_paged_kv_indices;
+#endif
+#if defined(MODE_ONLINE_PINNED)
+  // Lock-free pinned request ring (capacity = MPK_PINNED_RING_CAPACITY,
+  // power-of-2) CPU is producer, GPU is consumer. Handshake: CPU writes data
+  // fields then sets ready=1 (release); GPU reads ready with acquire, consumes,
+  // then clears to 0.
+  int32_t volatile *pinned_req_ready; // 0=empty, 1=request ready
+  int32_t *pinned_req_request_id;
+  int32_t *pinned_req_prompt_len;
+  int32_t *pinned_req_initial_step; // reserved for prefix-cache (always 0 now)
+  // Lock-free pinned completion ring (capacity = MPK_PINNED_RING_CAPACITY)
+  // GPU is producer, CPU is consumer.
+  // Handshake: GPU writes data fields then sets ready=1 (release); CPU reads
+  // ready with acquire, processes, then clears to 0.
+  int32_t volatile *pinned_comp_ready; // 0=empty, 1=completion ready
+  int32_t *pinned_comp_request_id;
+  int32_t *pinned_comp_buffer_row;
+  int32_t *pinned_comp_final_step;
+  // GPU-private ring cursors — allocated with gpu_malloc, never touched by CPU.
+  int32_t *gpu_req_head;  // GPU consumer cursor into pinned request ring
+  int32_t *gpu_comp_tail; // GPU producer cursor into pinned completion ring
+  // CPU→GPU shutdown signal: CPU writes 1 to request kernel termination.
+  // GPU polls with ld.acquire.sys when the batch is empty.
+  int32_t volatile *pinned_shutdown; // 0=running, 1=shutdown requested
+  // Per-row progress and release handshake. GPU publishes a nonnegative decode
+  // step. After it reads completed output, CPU stores -1 to release the row.
+  int32_t volatile
+      *pinned_step; // [total_inflight], pinned, indexed by buffer row
+  // Pinned inbox: CPU writes prompt tokens here before submitting a request
+  // via the ring buffer. GPU copies from inbox to the allocated buffer row.
+  int64_t *pinned_inbox_tokens; // [MPK_PINNED_RING_CAPACITY * max_seq_length],
+                                // pinned (one inbox per ring slot)
+  // Pinned rid→row mapping: GPU writes pinned_rid_at_row[row] = rid when
+  // allocating a buffer row so CPU can discover which row its request is
+  // on by scanning rows, then poll pinned_step[row] for per-step streaming.
+  int32_t volatile *pinned_rid_at_row; // [total_inflight], pinned
+  // Running queue rid tracking: request_rids[i] stores the original rid
+  // for active batch slot i (GPU device memory).
+  int *request_rids; // [MPK_MAX_NUM_BATCHED_REQUESTS]
+  // Free row pool — stack of available buffer row indices (GPU device
+  // memory).  Sized for max_num_batched_requests (no GPU waiting queue).
+  int *free_rows;    // [MPK_MAX_NUM_BATCHED_REQUESTS]
+  int *free_row_top; // stack pointer
+#endif
   void *profiler_buffer;
-  bool verbose;
-  bool profiling;
+  bool split_worker_scheduler;
+  cudaStream_t worker_stream, scheduler_stream;
+  cudaEvent_t prepare_done_event;
+  cudaEvent_t worker_done_event, scheduler_done_event;
+#ifdef USE_NVSHMEM
+  nvshmem_team_t *nvshmem_teams;
+#endif
 };
 
 } // namespace runtime

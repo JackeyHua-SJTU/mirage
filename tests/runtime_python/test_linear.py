@@ -1,4 +1,3 @@
-import mirage as mi
 import torch
 import runtime_kernel
 
@@ -7,12 +6,14 @@ torch.set_printoptions(sci_mode=False)
 reduction_size = 4096
 output_sizes = [16, 32, 64]
 
+batch_size = 6
+
 for output_size in output_sizes:
     print(f"\n=== Testing output_size = {output_size} ===")
-    x = torch.randn((1, reduction_size), device="cuda", dtype=torch.bfloat16)
+    x = torch.randn((batch_size, reduction_size), device="cuda", dtype=torch.bfloat16)
     w = torch.randn((output_size, reduction_size), device="cuda", dtype=torch.bfloat16)
-    residual = torch.randn((1, output_size), device="cuda", dtype=torch.bfloat16)
-    output = torch.empty(1, output_size, device="cuda", dtype=torch.bfloat16)
+    residual = torch.randn((batch_size, output_size), device="cuda", dtype=torch.bfloat16)
+    output = torch.empty(batch_size, output_size, device="cuda", dtype=torch.bfloat16)
 
     runtime_kernel.linear(x, w, residual, output)
     torch_out = torch.matmul(x, torch.transpose(w, 0, 1)) + residual
@@ -37,13 +38,15 @@ for output_size in output_sizes:
     total_time = starter.elapsed_time(ender)
     avg_time = total_time / repetitions
     print(f"Average time over {repetitions} runs: {avg_time:.6f} ms")
+    continue
 
     # Compare with Mirage
+    import mirage as mi
 
     graph = mi.new_kernel_graph()
-    X = graph.new_input(dims=(1, reduction_size), dtype=mi.bfloat16)
+    X = graph.new_input(dims=(batch_size, reduction_size), dtype=mi.bfloat16)
     W = graph.new_input(dims=(reduction_size, output_size), dtype=mi.bfloat16)
-    b = graph.new_input(dims=(1, output_size), dtype=mi.bfloat16)
+    b = graph.new_input(dims=(batch_size, output_size), dtype=mi.bfloat16)
     tb_graph = mi.new_threadblock_graph(
         grid_dim=(1, 1, 1),
         block_dim=(128, 1, 1),

@@ -15,6 +15,7 @@
 
 from CCore cimport *
 from cpython cimport array
+from libc.stdlib cimport malloc, free
 import ctypes
 import array
 import numpy as np
@@ -26,11 +27,14 @@ from libcpp.string cimport string
 class dtype:
     SINT_TYPES = ['int8', 'int16', 'int32', 'int64']
     UINT_TYPES = ['uint8', 'uint16', 'uint32', 'uint64']
-    FP_TYPES = ['fp16', 'bf16', 'fp32', 'fp64']
+    FP_TYPES = ['fp8', 'fp8_e4m3', 'fp16', 'bf16', 'fp32', 'fp64']
 
     def __init__(self, name):
         self.name = name
         assert name in dtype.SINT_TYPES + dtype.UINT_TYPES + dtype.FP_TYPES, name
+
+    def is_fp8(self):
+        return self.name == 'fp8'
 
     def is_fp16(self):
         return self.name == 'fp16'
@@ -97,10 +101,12 @@ uint8 = dtype('uint8')
 uint16 = dtype('uint16')
 uint32 = dtype('uint32')
 uint64 = dtype('uint64')
+float8 = dtype('fp8')
 float16 = dtype('fp16')
 bfloat16 = dtype('bf16')
 float32 = dtype('fp32')
 float64 = dtype('fp64')
+float8_e4m3 = dtype('fp8_e4m3')
 
 def get_kn_operator_type_string(int op_type):
     if op_type == KN_UNKOWN:
@@ -216,6 +222,8 @@ def get_tb_operator_type_string(int op_type):
         return "tb_mul_op"
     elif op_type == TB_DIV_OP:
         return "tb_div_op"
+    elif op_type == TB_SUB_OP:
+        return "tb_sub_op"
     elif op_type == TB_POW_OP:
         return "tb_pow_op"
     elif op_type == TB_REDUCTION_FIRST_OP_ID:
@@ -232,6 +240,12 @@ def get_tb_operator_type_string(int op_type):
         return "tb_reduction_1_to_dimx_op"
     elif op_type == TB_REDUCTION_2_TO_DIMX_OP:
         return "tb_reduction_2_to_dimx_op"
+    elif op_type == TB_REDUCTION_0_MAX_OP:
+        return "tb_reduction_0_max_op"
+    elif op_type == TB_REDUCTION_1_MAX_OP:
+        return "tb_reduction_1_max_op"
+    elif op_type == TB_REDUCTION_2_MAX_OP:
+        return "tb_reduction_2_max_op"
     elif op_type == TB_REDUCTION_LAST_OP_ID:
         return "tb_reduction_last_op_id"
     elif op_type == TB_RMS_NORM_OP:
@@ -268,6 +282,12 @@ def get_tb_operator_type_string(int op_type):
         return "tb_forloop_accum_red_ld_rms_op"
     elif op_type == TB_FORLOOP_ACCUM_REDTOX_LD_SUM_OP:
         return "tb_forloop_accum_redtox_ld_sum_op"
+    elif op_type == TB_FORLOOP_ACCUM_NO_RED_RESCALE_OP:
+        return "tb_forloop_accum_no_red_rescale_op"
+    elif op_type == TB_FORLOOP_ACCUM_RED_LD_SUM_RESCALE_OP:
+        return "tb_forloop_accum_red_ld_sum_rescale_op"
+    elif op_type == TB_FORLOOP_ACCUM_MAX_OP:
+        return "tb_forloop_accum_max_op"
     elif op_type == TB_FORLOOP_ACCUM_LAST_OP:
         return "tb_forloop_accum_last_op"
     elif op_type == TB_CUSTOMIZED_OP:
@@ -277,8 +297,14 @@ def get_tb_operator_type_string(int op_type):
 
 
 def convert_dtype_to_ctype(type : dtype):
-    if type.is_int8():
+    if type.is_fp8():
+        return DT_FLOAT8
+    elif type.is_int8():
         return DT_INT8
+    elif type.is_uint8():
+        return DT_UINT8
+    elif type.is_int16():
+        return DT_INT16
     elif type.is_uint16():
         return DT_UINT16
     elif type.is_fp16():
@@ -287,16 +313,30 @@ def convert_dtype_to_ctype(type : dtype):
         return DT_BFLOAT16
     elif type.is_fp32():
         return DT_FLOAT32
+    elif type.is_uint32():
+        return DT_UINT32
+    elif type.is_int32():
+        return DT_INT32
     elif type.is_int64():
         return DT_INT64
+    elif type.is_uint64():
+        return DT_UINT64
     elif type.is_fp64():
         return DT_DOUBLE
+    elif type.name == 'fp8_e4m3':
+        return DT_FLOAT8
     else:
-        raise RuntimeError(f"Unsupported dtype: {dtype}")
+        raise RuntimeError(f"Unsupported dtype: {type}")
 
 def convert_dtype_to_torch_type(type : dtype):
-    if type.is_int8():
+    if type.is_fp8():
+        return torch.float8_e4m3fn
+    elif type.is_int8():
         return torch.int8
+    elif type.is_uint8():
+        return torch.uint8
+    elif type.is_int16():
+        return torch.int16
     elif type.is_uint16():
         return torch.uint16
     elif type.is_fp16():
@@ -305,32 +345,66 @@ def convert_dtype_to_torch_type(type : dtype):
         return torch.bfloat16
     elif type.is_fp32():
         return torch.float32
+    elif type.is_int32():
+        return torch.int32
     elif type.is_int64():
         return torch.int64
     elif type.is_fp64():
         return torch.float64
+    elif type.name == 'fp8_e4m3':
+        return torch.float8_e4m3fn
     else:
         assert False, "Unsupported dtype: {}".format(type)
 
 def convert_ctype_to_dtype(type):
-    if type == DT_INT8:
+    if type == DT_FLOAT8:
+        return float8
+    elif type == DT_INT8:
         return int8
+    elif type == DT_UINT8:
+        return uint8
+    elif type == DT_INT16:
+        return int16
     elif type == DT_UINT16:
         return uint16
     elif type == DT_FLOAT16:
         return float16
     elif type == DT_BFLOAT16:
         return bfloat16
+    elif type == DT_INT32:
+        return int32
     elif type == DT_FLOAT32:
         return float32
+    elif type == DT_UINT32:
+        return uint32
+    elif type == DT_INT64:
+        return int64
+    elif type == DT_UINT64:
+        return uint64
     elif type == DT_DOUBLE:
         return float64
+    elif type == DT_FLOAT8:
+        return float8_e4m3
     else:
         return None
 
 def convert_torch_type_to_dtype(type):
-    if type is torch.int8:
+    if type is torch.float8_e4m3fn:
+        return float8
+    elif type is torch.float8_e4m3fnuz:
+        return float8
+    elif type is torch.float8_e5m2:
+        return float8
+    elif type is torch.float8_e5m2fnuz:
+        return float8
+    elif type is torch.float8_e8m0fnu:
+        return float8
+    elif type is torch.int8:
         return int8
+    elif type is torch.uint8:
+        return uint8
+    elif type is torch.int16:
+        return int16
     elif type is torch.uint16:
         return uint16
     elif type is torch.float16:
@@ -339,10 +413,16 @@ def convert_torch_type_to_dtype(type):
         return bfloat16
     elif type is torch.float32:
         return float32
+    elif type is torch.int32:
+        return int32
+    elif type is torch.uint32:
+        return uint32
     elif type is torch.int64:
         return int64
     elif type is torch.float64:
         return float64
+    elif type is torch.float8_e4m3fn:
+        return float8_e4m3
     else:
         raise RuntimeError(f"Unsupported dtype: {type}")
 
@@ -371,6 +451,15 @@ def string_to_accum_optype(acc):
         assert False, "Unsupported accum optype"
         return None
 
+def string_to_accum_rescale_optype(acc):
+     if acc is None:
+         return TB_FORLOOP_ACCUM_NO_RED_RESCALE_OP
+     elif acc == "sum":
+         return TB_FORLOOP_ACCUM_RED_LD_SUM_RESCALE_OP
+     else:
+         assert False, "Unsupported accum rescale optype"
+         return None
+
 cdef class DTensor:
     cdef CppDTensor* c_ptr # Hold a Tensor instance
 
@@ -389,13 +478,34 @@ cdef class DTensor:
             else:
                 return self.c_ptr.guid
 
+    property base_guid:
+        def __get__(self):
+            if self.c_ptr == NULL:
+                return None
+            else:
+                return self.c_ptr.base_guid
+
+    property view_offset:
+        def __get__(self):
+            if self.c_ptr == NULL:
+                return None
+            else:
+                return self.c_ptr.view_offset
+
+    property is_virtual:
+        def __get__(self):
+            if self.c_ptr == NULL:
+                return False
+            else:
+                return self.c_ptr.base_guid != 0
+
     property tensor:
         def __get__(self):
             if self.c_ptr == NULL:
                 return None
             else:
                 return ctypes.cast(<unsigned long long>self.c_ptr, ctypes.c_void_p)
-        
+
         def __set__(self, value):
             self._set_tensor(value)
 
@@ -423,6 +533,18 @@ cdef class DTensor:
         else:
             assert False , "Error: index out of range"
             return None
+
+    @property
+    def shape(self):
+        if self.c_ptr == NULL:
+            return None
+        return tuple(self.c_ptr.dim[i] for i in range(self.c_ptr.num_dims))
+
+    @property
+    def stride(self):
+        if self.c_ptr == NULL:
+            return None
+        return tuple(self.c_ptr.stride[i] for i in range(self.c_ptr.num_dims))
 
 cdef class STensor:
     cdef CppSTensor* c_ptr # Hold a CppSTensor instance
@@ -762,9 +884,12 @@ cdef class CyKNGraph:
         cinputs.resize(len(inputs))
         cdef DTensor t
         for i in range(len(inputs)):
-            assert(type(inputs[i]) == DTensor)
-            t = inputs[i]
-            cinputs[i] = t.c_ptr
+            if inputs[i] is None:
+                cinputs[i] = NULL
+            else:
+                assert (type(inputs[i]) == DTensor)
+                t = inputs[i]
+                cinputs[i] = t.c_ptr
         cdef CppDTensor* coutputs[1024]
         num_outputs = self.p_kgraph.customized(cinputs, coutputs, bgraph.p_bgraph)
         outputs = list()
@@ -919,6 +1044,77 @@ cdef class CyKNGraph:
         output = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
         return DTensor(output)
 
+    def shuffle_tensors(self, list[DTensor] inputs, int shuffled_dim, int num_groups, str name):
+        cdef vector[const CppDTensor*] cinputs
+        cinputs.resize(len(inputs))
+        cdef DTensor t
+        for i in range(len(inputs)):
+            assert(type(inputs[i]) == DTensor)
+            t = inputs[i]
+            cinputs[i] = t.c_ptr
+        cdef char* cname = NULL
+        if name is not None:
+            py_byte_string = name.encode('UTF-8')
+            cname = py_byte_string
+        cdef CppDTensor* ptr = self.p_kgraph.shuffle_tensors(cinputs, shuffled_dim, num_groups, cname)
+        output = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
+        return DTensor(output)
+
+    def view(self, DTensor input, list new_shape):
+        """Create a virtual DTensor (view) with a new shape, sharing the
+        underlying memory of `input`. Total element count must match."""
+        cdef vector[int] cshape
+        cshape.resize(len(new_shape))
+        for i in range(len(new_shape)):
+            cshape[i] = new_shape[i]
+        cdef CppDTensor* ptr = self.p_kgraph.view(input.c_ptr, cshape)
+        output = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
+        return DTensor(output)
+
+    def narrow(self, DTensor input, int dim, int start, int length):
+        """Create a virtual DTensor that is a contiguous sub-window of
+        `input` along `dim`, from `start` for `length` elements."""
+        cdef CppDTensor* ptr = self.p_kgraph.narrow(input.c_ptr, dim, start, length)
+        output = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
+        return DTensor(output)
+
+    def split(self, DTensor input, sizes_or_chunks, int dim):
+        """Split `input` into virtual DTensors along `dim`.
+
+        sizes_or_chunks may be:
+          - int N: split into N equal-sized slices (input.dim[dim] must be
+            divisible by N).
+          - list of ints: explicit sizes; their sum must equal
+            input.dim[dim].
+        Returns a list of view DTensors.
+        """
+        cdef vector[int] csizes
+        if isinstance(sizes_or_chunks, int):
+            n = int(sizes_or_chunks)
+            assert n > 0, "chunk count must be positive"
+            slice_dim = input.dim(dim)
+            assert slice_dim % n == 0, \
+                "input.dim[dim] (%d) must be divisible by chunk count (%d)" % (slice_dim, n)
+            slice_len = slice_dim // n
+            csizes.resize(n)
+            for i in range(n):
+                csizes[i] = slice_len
+        else:
+            csizes.resize(len(sizes_or_chunks))
+            for i in range(len(sizes_or_chunks)):
+                csizes[i] = int(sizes_or_chunks[i])
+        cdef int num_outputs = csizes.size()
+        cdef CppDTensor** outputs = <CppDTensor**>malloc(num_outputs * sizeof(CppDTensor*))
+        if outputs == NULL:
+            raise MemoryError("failed to allocate split output buffer")
+        cdef int produced = self.p_kgraph.split(input.c_ptr, csizes, dim, outputs)
+        result = []
+        for i in range(produced):
+            result.append(DTensor(ctypes.cast(<unsigned long long>outputs[i], ctypes.c_void_p)))
+        free(outputs)
+        return result
+
+
     def register_task(self, CyTBGraph bgraph, str task_type, list[int] params):
         cdef char* cname = NULL
         if task_type is not None:
@@ -974,7 +1170,10 @@ cdef class CyTBGraph:
         c_input_map.x = input_map[0]
         c_input_map.y = input_map[1]
         c_input_map.z = input_map[2]
-        cdef CppSTensor* ptr = self.p_bgraph.new_input(dtensor.c_ptr, c_input_map, forloop_dim, SmemRowMajor, store_in_dmem)
+        cdef CppDTensor* dtensor_cptr = NULL
+        if dtensor is not None:
+            dtensor_cptr = dtensor.c_ptr
+        cdef CppSTensor* ptr = self.p_bgraph.new_input(dtensor_cptr, c_input_map, forloop_dim, SmemRowMajor, store_in_dmem)
         t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
         return STensor(t)
 
@@ -1027,6 +1226,11 @@ cdef class CyTBGraph:
         t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
         return STensor(t)
 
+    def mul_scalar(self, STensor A, float scalar):
+        cdef CppSTensor* ptr = self.p_bgraph.mul_scalar(A.c_ptr, scalar)
+        t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
+        return STensor(t)
+
     def add(self, STensor A, STensor B):
         cdef CppSTensor* ptr = self.p_bgraph.add(A.c_ptr, B.c_ptr)
         t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
@@ -1042,10 +1246,21 @@ cdef class CyTBGraph:
         t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
         return STensor(t)
 
+    def sub(self, STensor A, STensor B):
+        cdef CppSTensor* ptr = self.p_bgraph.sub(A.c_ptr, B.c_ptr)
+        t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
+        return STensor(t)
+
     def reduction(self, STensor A, int dim):
         cdef CppSTensor* ptr = self.p_bgraph.reduction(A.c_ptr, dim)
         t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
         return STensor(t)
+
+    def reduction_max(self, STensor A, int dim):
+        cdef vector[CppSTensor*] ptr = self.p_bgraph.reduction_max(A.c_ptr, dim)
+        t0 = ctypes.cast(<unsigned long long>ptr[0], ctypes.c_void_p)
+        t1 = ctypes.cast(<unsigned long long>ptr[1], ctypes.c_void_p)
+        return STensor(t0), STensor(t1)
 
     def rms_norm(self, STensor A):
         cdef CppSTensor* ptr = self.p_bgraph.rms_norm(A.c_ptr)
@@ -1060,6 +1275,17 @@ cdef class CyTBGraph:
     def forloop_accum(self, STensor A, str acc):
         optype = string_to_accum_optype(acc)
         cdef CppSTensor* ptr = self.p_bgraph.forloop_accum(A.c_ptr, optype)
+        t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
+        return STensor(t)
+
+    def forloop_accum_rescale(self, STensor A, STensor B, str acc):
+        optype = string_to_accum_rescale_optype(acc)
+        cdef CppSTensor* ptr = self.p_bgraph.forloop_accum_rescale(A.c_ptr, B.c_ptr, optype)
+        t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
+        return STensor(t)
+
+    def forloop_accum_max(self, STensor A):
+        cdef CppSTensor* ptr = self.p_bgraph.forloop_accum_max(A.c_ptr)
         t = ctypes.cast(<unsigned long long>ptr, ctypes.c_void_p)
         return STensor(t)
 
@@ -1085,7 +1311,7 @@ cdef class CyTBGraph:
                 operators.append(CyTBOperator(ptr))
             return operators
 
-def search(CyKNGraph input_graph, *, int max_num_new_graphs = 1024, list imaps = None, list omaps = None, list griddims = None, list blockdims = None, list fmaps = None, list franges = None, str previous_checkpoint = None, bool verbose, str default_config = None):
+def search(CyKNGraph input_graph, *, str backend = "cuda", int max_num_new_graphs = 1024, list imaps = None, list omaps = None, list griddims = None, list blockdims = None, list fmaps = None, list franges = None, str previous_checkpoint = None, bool verbose, str default_config = None, bool is_formal_verified):
     # set cimaps
     cdef vector[MInt3] cimaps
     cimaps.resize(0)
@@ -1143,17 +1369,24 @@ def search(CyKNGraph input_graph, *, int max_num_new_graphs = 1024, list imaps =
     cdef CppKNGraph* cnewgraphs[1024]
     # set verbose
     cverbose = verbose
+    # set backend
+    cdef char* cbackend = NULL
+    if backend is not None:
+        py_byte_string_backend = backend.encode('UTF-8')
+        cbackend = py_byte_string_backend
     # set previous_checkpoint
     cdef char* cprevious_checkpoint = NULL
     if previous_checkpoint is not None:
-        py_byte_string = previous_checkpoint.encode('UTF-8')
-        cprevious_checkpoint = py_byte_string
+        py_byte_string_cp = previous_checkpoint.encode('UTF-8')
+        cprevious_checkpoint = py_byte_string_cp
     # convert config description
     cdef char* cconfig = NULL
     if default_config is not None:
-        py_byte_string = default_config.encode('UTF-8')
-        cconfig = py_byte_string
-    num = cython_search(input_graph.p_kgraph, max_num_new_graphs, cnewgraphs, cimaps, comaps, cgriddims, cblockdims, cfmaps, cfranges, cprevious_checkpoint, cverbose, cconfig)
+        py_byte_string_config = default_config.encode('UTF-8')
+        cconfig = py_byte_string_config
+    # set is_formal_verified
+    cis_formal_verifed = is_formal_verified
+    num = cython_search(input_graph.p_kgraph, cbackend, max_num_new_graphs, cnewgraphs, cimaps, comaps, cgriddims, cblockdims, cfmaps, cfranges, cprevious_checkpoint, cverbose, cconfig, cis_formal_verifed)
     new_graphs = list()
     for i in range(num):
         ptr = ctypes.cast(<unsigned long long>cnewgraphs[i], ctypes.c_void_p)

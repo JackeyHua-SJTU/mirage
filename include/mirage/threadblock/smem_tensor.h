@@ -113,6 +113,10 @@ struct alignas(16) STensor {
   }
 
   size_t size() const {
+    if (num_dims == 0) {
+      // Special treatment for empty tensors
+      return 0;
+    }
     size_t num_elements = 1;
     using namespace mirage::type;
     size_t data_type_size = 1;
@@ -126,7 +130,8 @@ struct alignas(16) STensor {
         data_type_size = 2;
         break;
       }
-      case DT_FLOAT32: {
+      case DT_FLOAT32:
+      case DT_INT32: {
         data_type_size = 4;
         break;
       }

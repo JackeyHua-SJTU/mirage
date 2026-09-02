@@ -17,6 +17,7 @@
 #include "mirage/kernel/device_memory_manager.h"
 #include "mirage/kernel/graph.h"
 #include "mirage/layout.h"
+#include "mirage/utils/fingerprint_functions.h"
 #include "mirage/utils/hash_utils.h"
 #include <cassert>
 #include <iostream>
@@ -84,6 +85,10 @@ KNMatmulOp::KNMatmulOp(Graph *_kgraph, DTensor const &A, DTensor const &B)
   }
   C.dim[C.num_dims - 1] = B.dim[C.num_dims - 1];
   C.layout = mirage::layout::DmemRowMajor;
+  // Output is freshly allocated row-major, so compute strides from C.dim.
+  for (int i = C.num_dims - 1; i >= 0; i--) {
+    C.stride[i] = (i == C.num_dims - 1) ? 1 : C.stride[i + 1] * C.dim[i + 1];
+  }
   C.data_type = A.data_type;
   C.owner_op = this;
   C.owner_ts_idx = 0;
@@ -111,28 +116,31 @@ void from_json(json const &j, KNMatmulOp &op) {
   j.at("output_tensors").get_to(op.output_tensors);
 }
 
-MatmulKey::MatmulKey(DTensor const &A, DTensor const &B)
-    : operand_a(A), operand_b(B) {}
+#ifdef MIRAGE_FINGERPRINT_USE_CPU
+bool KNMatmulOp::fingerprint(void) {
+  DeviceMemoryManager *dmm = DeviceMemoryManager::get_instance();
 
-bool MatmulKey::operator==(MatmulKey const &b) const {
-  if (b.operand_a != operand_a) {
-    return false;
+  int B = 1;
+  for (int i = 0; i < input_tensors[0].num_dims - 2; ++i) {
+    B *= input_tensors[0].dim[i];
   }
-  if (b.operand_b != operand_b) {
-    return false;
+  int M = input_tensors[0].dim[input_tensors[0].num_dims - 2];
+  int N = input_tensors[1].dim[input_tensors[1].num_dims - 1];
+  int K = input_tensors[0].dim[input_tensors[0].num_dims - 1];
+
+  for (int device_id = 0; device_id < kgraph->gpu_dim.x; ++device_id) {
+    type::FPType *A_ptr = reinterpret_cast<type::FPType *>(
+        dmm->fp_base_ptr[device_id] + input_tensors[0].fp_offset);
+    type::FPType *B_ptr = reinterpret_cast<type::FPType *>(
+        dmm->fp_base_ptr[device_id] + input_tensors[1].fp_offset);
+    type::FPType *C_ptr = reinterpret_cast<type::FPType *>(
+        dmm->fp_base_ptr[device_id] + output_tensors[0].fp_offset);
+    utils::compute_matmul_fingerprint(A_ptr, B_ptr, C_ptr, B, M, N, K);
   }
+
   return true;
 }
+#endif // MIRAGE_FINGERPRINT_USE_CUDA
 
 } // namespace kernel
 } // namespace mirage
-
-namespace std {
-size_t hash<mirage::kernel::MatmulKey>::operator()(
-    mirage::kernel::MatmulKey const &key) const {
-  size_t ret = 0;
-  hash_combine(ret, key.operand_a);
-  hash_combine(ret, key.operand_b);
-  return ret;
-}
-}; // namespace std

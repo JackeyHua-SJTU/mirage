@@ -20,7 +20,7 @@ from libcpp cimport bool
 
 ctypedef unsigned long int size_t
 
-cdef extern from "vector_types.h":
+cdef extern from "mirage/vector_types.h":
     ctypedef struct dim3:
         unsigned int x
         unsigned int y
@@ -128,6 +128,9 @@ cdef extern from "mirage/type.h" namespace "mirage::type":
         TB_REDUCTION_0_TO_DIMX_OP = 2304,
         TB_REDUCTION_1_TO_DIMX_OP = 2305,
         TB_REDUCTION_2_TO_DIMX_OP = 2306,
+        TB_REDUCTION_0_MAX_OP = 2307,
+        TB_REDUCTION_1_MAX_OP = 2308,
+        TB_REDUCTION_2_MAX_OP = 2309,
         TB_REDUCTION_LAST_OP_ID = 2349,
         TB_RMS_NORM_OP = 2350,
         # Concat
@@ -150,6 +153,9 @@ cdef extern from "mirage/type.h" namespace "mirage::type":
         TB_FORLOOP_ACCUM_RED_LD_MEAN_OP = 2502,
         TB_FORLOOP_ACCUM_RED_LD_RMS_OP = 2503,
         TB_FORLOOP_ACCUM_REDTOX_LD_SUM_OP = 2504,
+        TB_FORLOOP_ACCUM_NO_RED_RESCALE_OP = 2505,
+        TB_FORLOOP_ACCUM_RED_LD_SUM_RESCALE_OP = 2506,
+        TB_FORLOOP_ACCUM_MAX_OP = 2507,
         TB_FORLOOP_ACCUM_LAST_OP = 2599,
         TB_CUSTOMIZED_OP = 2999
 
@@ -172,7 +178,10 @@ cdef extern from "mirage/kernel/device_tensor.h" namespace "mirage::kernel":
         DmemLayout layout
         int num_dims
         int dim[4]
+        long long stride[4]
         size_t guid
+        size_t base_guid
+        long long view_offset
         #KNOperator *owner_op
         #void *data_ptr
         int owner_ts_idx
@@ -238,6 +247,20 @@ cdef extern from "mirage/kernel/graph.h" namespace "mirage::kernel":
                                  int fused_dim,
                                  int num_groups,
                                  const char *name)
+        CppDTensor* shuffle_tensors(vector[const CppDTensor*] inputs,
+                                 int shuffled_dim,
+                                 int num_groups,
+                                 const char *name)
+        CppDTensor* view(const CppDTensor *input,
+                         vector[int] new_shape) except +
+        CppDTensor* narrow(const CppDTensor *input,
+                           int dim,
+                           int start,
+                           int length) except +
+        int split(const CppDTensor *input,
+                  vector[int] sizes,
+                  int dim,
+                  CppDTensor **outputs) except +
         void register_task(const char *task_type,
                            vector[int] params)
         TaskGraphResult generate_task_graph(int num_gpus, int my_gpu_id)
@@ -294,19 +317,27 @@ cdef extern from "mirage/threadblock/graph.h" namespace "mirage::threadblock":
         CppSTensor* clamp(const CppSTensor *A, float min_val, float max_val)
         CppSTensor* square(const CppSTensor *A)
         CppSTensor* sqrt(const CppSTensor *A)
+        CppSTensor* mul_scalar(const CppSTensor *A, float scalar)
         CppSTensor* add(const CppSTensor *A,
                      const CppSTensor *B)
         CppSTensor* mul(const CppSTensor *A,
                      const CppSTensor *B)
         CppSTensor* div(const CppSTensor *A,
                      const CppSTensor *B)
+        CppSTensor* sub(const CppSTensor *A,
+                     const CppSTensor *B)
         CppSTensor* reduction(const CppSTensor *A, int dim)
+        vector[CppSTensor*] reduction_max(const CppSTensor *A, int dim)
         CppSTensor* rms_norm(const CppSTensor *A)
         CppSTensor* concat(const CppSTensor *A,
                         const CppSTensor *B,
                         int dim)
         CppSTensor* forloop_accum(const CppSTensor *A,
                                TBOperatorType optype)
+        CppSTensor* forloop_accum_rescale(const CppSTensor *A,
+                               const CppSTensor *B,
+                               TBOperatorType optype)
+        CppSTensor* forloop_accum_max(const CppSTensor *A)
         dim3 grid_dim
         dim3 block_dim
         int forloop_range
@@ -324,6 +355,7 @@ cdef extern from "mirage/search/search_c.h" namespace "mirage::search_c":
         unsigned int z
 
     cdef int cython_search(const CppKNGraph *input_graph,
+                           const char *backend,
                            int max_num_new_graphs,
                            CppKNGraph** new_graphs,
                            vector[MInt3] imaps,
@@ -334,7 +366,8 @@ cdef extern from "mirage/search/search_c.h" namespace "mirage::search_c":
                            vector[int] franges,
                            const char * filename,
                            bool verbose,
-                           const char * default_config)
+                           const char * default_config,
+                           bool is_formal_verified)
     
     cdef void cython_to_json(const CppKNGraph *input_graph,
                              const char *filename)

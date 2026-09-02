@@ -17,6 +17,7 @@
 #include "mirage/kernel/device_memory_manager.h"
 #include "mirage/kernel/graph.h"
 #include "mirage/layout.h"
+#include "mirage/utils/fingerprint_functions.h"
 #include "mirage/utils/hash_utils.h"
 #include <cassert>
 
@@ -103,10 +104,16 @@ KNRMSNormOp::KNRMSNormOp(Graph *_kgraph,
   for (size_t i = 0; i < normalized_shape.size(); i++) {
     normalized_size *= normalized_shape[i];
   }
+  // Shape-preserving op: dim[] and stride[] both carry over from `input`
+  // verbatim via the DTensor copy; no need to recompute strides.
   DTensor output = input;
   output.owner_op = this;
   output.owner_ts_idx = 0;
   output.guid = DTensor::next_guid++;
+  // Output gets its own allocation; clear base_guid/view_offset so codegen
+  // does not route writes through input's parent IODesc when input is a view.
+  output.base_guid = 0;
+  output.view_offset = 0;
   kgraph->allocate(output);
   output_tensors.push_back(output);
 }
@@ -122,6 +129,31 @@ KNRMSNormOp::operator json() const {
               {"input_tensors", input_tensors},
               {"output_tensors", output_tensors}};
 }
+
+#ifdef MIRAGE_FINGERPRINT_USE_CPU
+bool KNRMSNormOp::fingerprint(void) {
+  int num_samples = output_tensors[0].num_elements() / normalized_size;
+  kernel::DeviceMemoryManager *dmm =
+      kernel::DeviceMemoryManager::get_instance();
+
+  for (int device_id = 0; device_id < dmm->num_devices; ++device_id) {
+    FPType *input_ptr = reinterpret_cast<FPType *>(dmm->fp_base_ptr[device_id] +
+                                                   input_tensors[0].fp_offset);
+    FPType *output_ptr = reinterpret_cast<FPType *>(
+        dmm->fp_base_ptr[device_id] + output_tensors[0].fp_offset);
+    utils::compute_rms_norm_fingerprint(input_ptr,
+                                        output_ptr,
+                                        dmm->div_p_lookup_table,
+                                        dmm->div_q_lookup_table,
+                                        dmm->sqrt_p_lookup_table,
+                                        dmm->sqrt_q_lookup_table,
+                                        num_samples,
+                                        normalized_size);
+  }
+
+  return true;
+}
+#endif
 
 } // namespace kernel
 } // namespace mirage

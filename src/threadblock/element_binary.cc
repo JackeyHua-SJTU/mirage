@@ -28,14 +28,6 @@ STensor *Graph::add(STensor const *input1, STensor const *input2) {
   return elementbinary(input1, input2, mirage::type::TB_ADD_OP);
 }
 
-STensor Graph::sub(STensor const &input1, STensor const &input2) {
-  return elementbinary(input1, input2, mirage::type::TB_SUB_OP);
-}
-
-STensor *Graph::sub(STensor const *input1, STensor const *input2) {
-  return elementbinary(input1, input2, mirage::type::TB_SUB_OP);
-}
-
 STensor Graph::mul(STensor const &input1, STensor const &input2) {
   return elementbinary(input1, input2, mirage::type::TB_MUL_OP);
 }
@@ -50,6 +42,14 @@ STensor Graph::div(STensor const &input1, STensor const &input2) {
 
 STensor *Graph::div(STensor const *input1, STensor const *input2) {
   return elementbinary(input1, input2, mirage::type::TB_DIV_OP);
+}
+
+STensor Graph::sub(STensor const &input1, STensor const &input2) {
+  return elementbinary(input1, input2, mirage::type::TB_SUB_OP);
+}
+
+STensor *Graph::sub(STensor const *input1, STensor const *input2) {
+  return elementbinary(input1, input2, mirage::type::TB_SUB_OP);
 }
 
 STensor Graph::pow(STensor const &input1, STensor const &input2) {
@@ -93,13 +93,6 @@ TBOperator *Graph::create_elementbinary_op(STensor const &input1,
       return nullptr;
     }
   }
-  // STensor output = input1;
-  // for (int i = 0; i < output.num_dims; i++) {
-  //   output.dim[i] = std::max(input1.dim[i], input2.dim[i]);
-  // }
-  // if (smem_offset + output.size() > (off_t)mirage::config::MAX_SMEM_SIZE) {
-  //   return nullptr;
-  // }
 
   TBElementBinaryOp *op = new TBElementBinaryOp(this, input1, input2, _type);
 

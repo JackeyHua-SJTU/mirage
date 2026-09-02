@@ -1,19 +1,48 @@
 import os
+import ctypes
+import z3
 
-try:
-    from .core import *
-except ImportError:
-    import z3
+def preload_so(lib_path, name_hint):
+    try:
+        ctypes.CDLL(lib_path)
+    except OSError as e:
+        raise ImportError(f"Could not preload {name_hint} ({lib_path}): {e}")
 
-    _z3_lib = os.path.join(os.path.dirname(z3.__file__), "lib")
-    os.environ["LD_LIBRARY_PATH"] = (
-        f"{_z3_lib}:{os.environ.get('LD_LIBRARY_PATH','LD_LIBRARY_PATH')}"
+_z3_libdir = os.path.join(os.path.dirname(z3.__file__), "lib")
+_z3_so_path = os.path.join(_z3_libdir, "libz3.so")
+preload_so(_z3_so_path, "libz3.so")
+
+_this_dir = os.path.dirname(__file__)
+_mirage_root = os.path.abspath(os.path.join(_this_dir, "..", ".."))
+
+def _find_native_lib(lib_name):
+    """Find a native .so, checking bundled location first (non-editable),
+    then build directory (editable install)."""
+    bundled = os.path.join(_this_dir, "lib", f"lib{lib_name}.so")
+    if os.path.isfile(bundled):
+        return bundled
+    editable = os.path.join(
+        _mirage_root, "build", lib_name, "release", f"lib{lib_name}.so"
+    )
+    if os.path.isfile(editable):
+        return editable
+    raise ImportError(
+        f"Could not find lib{lib_name}.so. Checked:\n"
+        f"  bundled: {bundled}\n  editable: {editable}"
     )
 
-    from .core import *
+_subexpr_so_path = _find_native_lib("abstract_subexpr")
+_formal_verifier_so_path = _find_native_lib("formal_verifier")
+preload_so(_subexpr_so_path, "libabstract_subexpr.so")
+preload_so(_formal_verifier_so_path, "libformal_verifier.so")
 
+from .core import *
 from .kernel import *
-from .persistent_kernel import PersistentKernel
+from .mpk.persistent_kernel import PersistentKernel
+from .mpk.speculative import spec_decode_class
+# Re-export MPK interfaces for external integrations (e.g., vLLM Mirage backend)
+from .mpk.mpk import MPK, MPKMetadata
+from .mpk.models.graph_builder import MirageModelConfig
 from .threadblock import *
 
 

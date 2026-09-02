@@ -15,6 +15,9 @@ def get_shared_memory_capacity(target_cc):
     elif target_cc == 90:
         # H100 GPUs
         return 223 * 1024
+    elif target_cc == 100:
+        # B200 GPUs
+        return 227 * 1024
     else:
         assert False, "Unsupported compute capacity: {}".format(target_cc)
 
@@ -35,6 +38,8 @@ def get_configurations_from_gpu(rank):
     worker = 0
     if sm_cnt >= 160:
         worker = 144
+    elif sm_cnt >= 144:
+        worker = 128
     elif sm_cnt >= 132:
         worker = 128
     elif sm_cnt >= 108:

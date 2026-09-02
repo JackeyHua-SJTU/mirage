@@ -1,5 +1,9 @@
 name: Clang format
-on: [push, pull_request, workflow_dispatch]
+on:
+  push:
+    branches: [mpk]
+  pull_request:
+  workflow_dispatch:
 
 jobs:
   formatting-check:
@@ -16,7 +20,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Run clang-format code style check
-        uses: jidicula/clang-format-action@v4.8.0
+        uses: jidicula/clang-format-action@v4.16.0
         with:
           clang-format-version: "15"
           check-path: ${{ matrix.path['check'] }}

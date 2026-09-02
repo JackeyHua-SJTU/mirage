@@ -161,10 +161,17 @@ KNElementUnaryOp::KNElementUnaryOp(Graph *_kgraph,
                                    DTensor const &input,
                                    mirage::type::KNOperatorType type)
     : mirage::kernel::KNOperator(_kgraph, type, input) {
+  // Shape-preserving op: dim[] and stride[] both carry over from `input`
+  // verbatim via the DTensor copy; no need to recompute strides.
   DTensor output = input;
   output.owner_op = this;
   output.owner_ts_idx = 0;
   output.guid = DTensor::next_guid++;
+  // The output gets its own allocation below; it is not a view of input.
+  // Clearing base_guid/view_offset prevents codegen from routing writes
+  // through the input's parent IODesc when `input` is a view.
+  output.base_guid = 0;
+  output.view_offset = 0;
   kgraph->allocate(output);
   assert(output_tensors.size() == 0);
   output_tensors.push_back(output);
@@ -181,6 +188,12 @@ KNElementUnaryOp::operator json() const {
               {"input_tensors", input_tensors},
               {"output_tensors", output_tensors}};
 }
+
+#ifdef MIRAGE_FINGERPRINT_USE_CPU
+bool KNElementUnaryOp::fingerprint(void) {
+  assert(false && "To be implemented");
+}
+#endif
 
 } // namespace kernel
 } // namespace mirage

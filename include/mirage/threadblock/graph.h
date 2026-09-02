@@ -20,8 +20,8 @@
 #include "mirage/threadblock/operator.h"
 #include "mirage/threadblock/serializer/kernel_params.h"
 #include "mirage/threadblock/smem_tensor.h"
+#include "mirage/vector_types.h"
 #include <vector>
-#include <vector_types.h>
 
 namespace mirage {
 namespace threadblock {
@@ -112,12 +112,12 @@ public:
   // element binary operators
   STensor add(STensor const &A, STensor const &B);
   STensor *add(STensor const *A, STensor const *B);
-  STensor sub(STensor const &A, STensor const &B);
-  STensor *sub(STensor const *A, STensor const *B);
   STensor mul(STensor const &A, STensor const &B);
   STensor *mul(STensor const *A, STensor const *B);
   STensor div(STensor const &A, STensor const &B);
   STensor *div(STensor const *A, STensor const *B);
+  STensor sub(STensor const &A, STensor const &B);
+  STensor *sub(STensor const *A, STensor const *B);
   STensor pow(STensor const &A, STensor const &B);
   STensor *pow(STensor const *A, STensor const *B);
 
@@ -141,7 +141,7 @@ public:
 
   // reduction_max operator
   std::vector<STensor> reduction_max(STensor const &A, int dim);
-  std::vector<STensor> *reduction_max(STensor const *A, int dim);
+  std::vector<STensor *> reduction_max(STensor const *A, int dim);
   TBOperator *create_reduction_max_op(STensor const &A, int dim);
 
   // rms_norm operator
@@ -174,21 +174,30 @@ public:
                                       STensor const &rescale,
                                       mirage::type::TBOperatorType type);
 
+  // forloop accum max operator
+  STensor forloop_accum_max(STensor const &input);
+
+  STensor *forloop_accum_max(STensor const *input);
+
+  TBOperator *create_forloop_accum_max_op(STensor const &input);
+
   // fingerprint related memory management
   off_t allocate_fingerprint(STensor const &tensor);
   void free_fingerprint(STensor const &tensor);
   void free_fingerprint(std::vector<STensor> const &tensors);
   size_t calculate_shared_memory_usage(TBOperator *new_op);
 
+#ifdef MIRAGE_BACKEND_USE_CUDA
   KernelParams get_kernel_params();
   NewKernelParams get_new_kernel_params(bool fingerprint) const;
+#endif
 
   int get_smem_size_with_pipeline() const;
 
   operator json() const;
 
 public:
-  dim3 grid_dim, block_dim, cluster_dim;
+  dim3 grid_dim, block_dim, cluster_dim{4, 4, 1};
   int forloop_range;
   int reduction_dimx;
   std::vector<mirage::threadblock::TBOperator *> operators;

@@ -9,7 +9,7 @@ dependencies:
   - pip
   - setuptools
   - pip:
-    - z3-solver==4.14.0.0
+    - z3-solver==4.16.0.0
     - transformers
     - cmake-build-extension
     - requests
@@ -19,6 +19,12 @@ dependencies:
     - cmake
     - cython
     - numpy==2.1.2
+    - accelerate==1.8.0
+    - protobuf
+    - tg4perfetto @ git+https://github.com/flashinfer-ai/tg4perfetto.git
+    - cuda-python
+    - fastapi
+    - uvicorn
     - torch==2.6.0+cu118
     - torchvision==0.21.0+cu118
     - torchaudio==2.6.0+cu118
