@@ -96,11 +96,22 @@ class OnlinePinnedRuntime:
         self._mask = self._cap - 1
         self._total_inflight = mpk.total_num_requests
 
-        # Pinned CPU↔GPU ring arrays (allocated in mpk.py, shape=[cap])
+        # Pinned CPU↔GPU ring arrays (allocated in mpk.py, shape=[cap]).
+        #
+        # A buffer the owner tick *writes* is held as a numpy view instead of
+        # a tensor.  The view aliases the same page-locked memory --
+        # the GPU cannot tell the difference -- but `tensor[i] = v` costs a full
+        # ATen dispatch (~4 us measured), and the owner tick writes a prefix
+        # array per publish plus up to MAX_EVICTIONS_PER_TICK page ids per
+        # return, on the thread that also drives admission.  The read side
+        # already batches through a tensor slice + tolist(); this gives the
+        # write side the same treatment.  Only the view is kept, so there is no
+        # second, slower way to write the same buffer -- and the view owns the
+        # storage, so the tensor needs no separate reference.
         self._req_ready         = mpk.pinned_req_ready        # int32, pinned
-        self._req_request_id    = mpk.pinned_req_request_id   # int32, pinned
-        self._req_prompt_len    = mpk.pinned_req_prompt_len   # int32, pinned
-        self._req_initial_step  = mpk.pinned_req_initial_step # int32, pinned
+        self._req_request_id    = mpk.pinned_req_request_id.numpy()
+        self._req_prompt_len    = mpk.pinned_req_prompt_len.numpy()
+        self._req_initial_step  = mpk.pinned_req_initial_step.numpy()
         self._comp_ready        = mpk.pinned_comp_ready       # int32, pinned
         self._comp_request_id   = mpk.pinned_comp_request_id  # int32, pinned
         self._comp_buffer_row   = mpk.pinned_comp_buffer_row  # int32, pinned
@@ -117,9 +128,9 @@ class OnlinePinnedRuntime:
         # import channel stays inert -- num_prefix_pages is always 0.
         self._comp_num_pages       = mpk.pinned_comp_num_pages
         self._comp_pages           = mpk.pinned_comp_pages
-        self._req_num_prefix_pages = mpk.pinned_req_num_prefix_pages
-        self._req_prefix_pages     = mpk.pinned_req_prefix_pages
-        self._page_return_ring     = mpk.pinned_page_return_ring
+        self._req_num_prefix_pages = mpk.pinned_req_num_prefix_pages.numpy()
+        self._req_prefix_pages     = mpk.pinned_req_prefix_pages.numpy()
+        self._page_return_ring     = mpk.pinned_page_return_ring.numpy()
         self._page_return_tail     = mpk.pinned_page_return_tail
         self._page_return_head_mirror = mpk.pinned_page_return_head_mirror
         self._page_free_count_mirror  = mpk.pinned_page_free_count_mirror
@@ -352,10 +363,10 @@ class OnlinePinnedRuntime:
         self._req_request_id[slot] = rid
         self._req_prompt_len[slot] = prompt_len
         self._req_initial_step[slot] = initial_step
+        npp = len(prefix_pages)
         base = slot * self._pages_per_req
-        for offset, page in enumerate(prefix_pages):
-            self._req_prefix_pages[base + offset] = page
-        self._req_num_prefix_pages[slot] = len(prefix_pages)
+        self._req_prefix_pages[base:base + npp] = prefix_pages
+        self._req_num_prefix_pages[slot] = npp
         self._store_i32_release(self._req_ready, slot, 1)
 
     def drain_completions(self) -> List[Tuple[int, int, int]]:
@@ -552,10 +563,19 @@ class OnlinePinnedRuntime:
         """
         if not pages:
             return
+        n = len(pages)
+        ring = self._page_return_ring
         tail = self._cpu_return_tail
-        for page in pages:
-            self._page_return_ring[tail & self._return_mask] = page
-            tail += 1
+        start = tail & self._return_mask
+        # The occupancy argument above bounds one write by the ring capacity,
+        # so it wraps at most once and two slices always suffice.  A batch that
+        # broke that bound raises a broadcast error here rather than silently
+        # overwriting entries the GPU has not drained yet.
+        head_len = min(n, ring.shape[0] - start)
+        ring[start:start + head_len] = pages[:head_len]
+        if head_len < n:
+            ring[:n - head_len] = pages[head_len:]
+        tail += n
         self._cpu_return_tail = tail
         self._store_i32_release(self._page_return_tail, 0, tail)
         self._page_stats["returned_pages"] += len(pages)
@@ -771,9 +791,9 @@ class OnlinePinnedRuntime:
                 # index simply stops claiming them.
                 self._cache.reset()
             self._req_ready.zero_()
-            self._req_request_id.zero_()
-            self._req_num_prefix_pages.zero_()
-            self._req_prefix_pages.zero_()
+            self._req_request_id[:] = 0
+            self._req_num_prefix_pages[:] = 0
+            self._req_prefix_pages[:] = 0
 
         with self._lock:
             self._cpu_comp_head = 0
@@ -790,7 +810,7 @@ class OnlinePinnedRuntime:
             # anything left in the ring from the previous session is a page the
             # new page_queue already owns.
             self._cpu_return_tail = 0
-            self._page_return_ring.zero_()
+            self._page_return_ring[:] = 0
             self._page_return_tail.zero_()
             self._page_return_head_mirror.zero_()
             self._page_free_count_mirror.zero_()

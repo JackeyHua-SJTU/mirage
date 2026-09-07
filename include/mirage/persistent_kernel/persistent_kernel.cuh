@@ -490,7 +490,20 @@ constexpr int MPK_PAGE_RETURN_DRAIN_LIMIT = 32;
 
 __device__ __forceinline__ bool
     prepare_next_batch(RuntimeConfig const &config) {
-  __shared__ int smem_kv_indices[MPK_MAX_NUM_PAGES];
+  // Step 2 snapshots the page table of the *current batch*, never the pool, so
+  // this is bounded by what the batch can hold: the admission gate reserves
+  // MPK_MAX_PAGES_PER_REQ per request (Step 4) and there are at most
+  // MPK_MAX_NUM_BATCHED_REQUESTS of them.
+  //
+  // Sizing it by MPK_MAX_NUM_PAGES instead made the pool a static-shared-memory
+  // cost paid by *every* block in the grid, workers included, even though only
+  // the one scheduler thread that runs this ever touches it. At PAGE_SIZE=64 a
+  // pool big enough to be worth caching into (8192 pages = 32 KB) pushed the
+  // worker launch past the 228 KB SM limit -- and the split worker/scheduler
+  // path does not check the launch, so it surfaced as the scheduler spinning
+  // forever against workers that never started, not as an error.
+  __shared__ int
+      smem_kv_indices[MPK_MAX_NUM_BATCHED_REQUESTS * MPK_MAX_PAGES_PER_REQ];
   int page_queue_head = *config.page_queue_head;
   int page_queue_tail = *config.page_queue_tail;
   int gpu_req_head = *config.gpu_req_head;
@@ -613,6 +626,9 @@ __device__ __forceinline__ bool
   // ── Step 2: snapshot current kv_indices to shared memory ───────────────────
   int num_pages_total =
       config.paged_kv_indptr_buffer[MPK_MAX_NUM_BATCHED_REQUESTS];
+  // Guards the batch-sized snapshot above. Compiled out under NDEBUG.
+  assert(num_pages_total <=
+         MPK_MAX_NUM_BATCHED_REQUESTS * MPK_MAX_PAGES_PER_REQ);
   for (int i = 0; i < num_pages_total; i++) {
     smem_kv_indices[i] = config.paged_kv_indices_buffer[i];
   }
