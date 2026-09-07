@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import collections
 import hashlib
+import heapq
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, NamedTuple, Optional, Sequence, Set, Tuple
 
@@ -118,6 +119,15 @@ class PrefixCache:
         self._index: Dict[int, List[Block]] = {}
         self._blocks: Set[Block] = set()
         self._by_page: Dict[int, Block] = {}
+        # Eviction candidates as a lazy min-heap of ``(lru_tick, seq, block)``.
+        # A block is pushed when it *becomes* an unpinned leaf -- on insert, on
+        # the unpin that drops its last pin, and on the removal that takes its
+        # last child -- so every evictable block always has an entry.  Entries
+        # are never removed when a block stops being evictable; :meth:`evict`
+        # validates on pop instead, which keeps every mutation O(log n) and the
+        # eviction order identical to a full scan for the minimum ``lru_tick``.
+        self._evictable: List[Tuple[int, int, Block]] = []
+        self._evict_seq = 0
         self._clock = 0
         self._stall_key = None
         self._stalled_for = 0
@@ -254,20 +264,26 @@ class PrefixCache:
 
         Leaf-first keeps every resident block's parent chain resident, which is
         what makes a chain lookup able to reach the block at all.
+
+        Removing a block hands its parent to :meth:`_mark_evictable`, so a
+        chain is walked leaf-upwards within a single call, exactly as a
+        repeated scan for the minimum ``lru_tick`` would.
         """
         pages: List[int] = []
-        while len(pages) < count:
-            victim = None
-            for block in self._blocks:
-                if block.refcount or block.children:
-                    continue
-                if victim is None or block.lru_tick < victim.lru_tick:
-                    victim = block
-            if victim is None:
-                break
-            self._remove_block(victim)
-            pages.append(victim.page_id)
+        heap = self._evictable
+        while len(pages) < count and heap:
+            lru_tick, _, block = heapq.heappop(heap)
+            # Stale entry: the block was evicted, re-pinned, gained a child, or
+            # was touched by a later match (which bumps lru_tick and pushes a
+            # fresh entry when the pin drops).  Membership is checked first --
+            # a removed block may still carry the state its entry recorded.
+            if (block not in self._blocks or block.refcount or block.children
+                    or block.lru_tick != lru_tick):
+                continue
+            self._remove_block(block)
+            pages.append(block.page_id)
         self._counts["evicted"] += len(pages)
+        self._compact_evictable()
         return pages
 
     def tick(
@@ -343,6 +359,7 @@ class PrefixCache:
         self._index.clear()
         self._blocks.clear()
         self._by_page.clear()
+        self._evictable.clear()
         self._counts.clear()
         self._stall_key = None
         self._stalled_for = 0
@@ -435,6 +452,7 @@ class PrefixCache:
         self._by_page[page] = block
         if parent is not None:
             parent.children.add(block)
+        self._mark_evictable(block)
         return block
 
     def _remove_block(self, block: Block) -> None:
@@ -446,10 +464,40 @@ class PrefixCache:
         del self._by_page[block.page_id]
         if block.parent is not None:
             block.parent.children.discard(block)
+            self._mark_evictable(block.parent)
+
+    def _mark_evictable(self, block: Block) -> None:
+        """Queue *block* as an eviction candidate if it is an unpinned leaf.
+
+        Called on every transition *into* that state, which is what makes the
+        heap a superset of the evictable blocks and lets :meth:`evict` trust a
+        validated pop.
+        """
+        if block.refcount or block.children or block not in self._blocks:
+            return
+        self._evict_seq += 1
+        heapq.heappush(self._evictable, (block.lru_tick, self._evict_seq, block))
+
+    def _compact_evictable(self) -> None:
+        """Rebuild the heap once stale entries outnumber the live blocks.
+
+        Entries are only invalidated lazily, so a long-lived cache would
+        otherwise grow the heap without bound.
+        """
+        if len(self._evictable) <= 2 * len(self._blocks) + 32:
+            return
+        self._evictable = [
+            entry for entry in self._evictable
+            if entry[2] in self._blocks and not entry[2].refcount
+            and not entry[2].children and entry[2].lru_tick == entry[0]
+        ]
+        heapq.heapify(self._evictable)
 
     def _unpin(self, block: Block) -> None:
         if block.refcount > 0:
             block.refcount -= 1
+            if block.refcount == 0:
+                self._mark_evictable(block)
         else:
             # A page exported by a request that never imported it: keep the
             # ledger monotone rather than letting a negative pin free it early.
